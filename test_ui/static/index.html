@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChRIS Streaming Workers — Test UI</title>
+<style>
+  :root { --bg: #1a1a2e; --surface: #16213e; --primary: #0f3460; --accent: #e94560; --text: #eee; --muted: #888; --ok: #4ade80; --err: #f87171; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { color: var(--accent); margin-bottom: 16px; font-size: 1.3em; }
+  h2 { color: var(--accent); font-size: 1em; margin-bottom: 8px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: var(--surface); border-radius: 8px; padding: 16px; border: 1px solid var(--primary); }
+  .full-width { grid-column: 1 / -1; }
+  label { display: block; color: var(--muted); font-size: 0.8em; margin-top: 8px; }
+  input, select { width: 100%; padding: 6px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--primary); border-radius: 4px; font-family: inherit; font-size: 0.85em; margin-top: 2px; }
+  button { padding: 8px 20px; border: none; border-radius: 4px; cursor: pointer; font-family: inherit; font-weight: bold; font-size: 0.85em; margin-top: 12px; margin-right: 6px; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary { background: var(--primary); color: var(--text); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  #status-log, #event-log { height: 300px; overflow-y: auto; background: var(--bg); border: 1px solid var(--primary); border-radius: 4px; padding: 8px; font-size: 0.8em; line-height: 1.5; margin-top: 8px; }
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.75em; font-weight: bold; }
+  .s-notStarted { background: var(--muted); color: #fff; }
+  .s-started { background: #3b82f6; color: #fff; }
+  .s-finishedSuccessfully, .s-confirmed_finishedSuccessfully { background: var(--ok); color: #000; }
+  .s-finishedWithError, .s-confirmed_finishedWithError { background: var(--err); color: #fff; }
+  .s-undefined, .s-confirmed_undefined { background: #fbbf24; color: #000; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line .ts { color: var(--muted); }
+  .log-line .stream-stderr { color: var(--err); }
+  .step { color: var(--muted); font-size: 0.8em; }
+  .step.active { color: var(--accent); font-weight: bold; }
+  .step.done { color: var(--ok); }
+  .step.error { color: var(--err); }
+  #workflow-steps { margin-top: 8px; }
+  .inline { display: flex; gap: 8px; align-items: end; }
+  .inline > div { flex: 1; }
+</style>
+</head>
+<body>
+
+<h1>ChRIS Streaming Workers — Test UI</h1>
+
+<div class="grid">
+
+  <!-- Job Submission Panel -->
+  <div class="panel">
+    <h2>Job Submission (via pfcon)</h2>
+    <label>Job ID</label>
+    <input id="job-id" value="test-job-1" />
+    <label>Plugin Image</label>
+    <input id="plugin-image" value="fnndsc/pl-simpledsapp" />
+    <div class="inline">
+      <div><label>Plugin Type</label><select id="plugin-type"><option value="ds" selected>ds</option><option value="fs">fs</option></select></div>
+      <div><label>CPU Limit (m)</label><input id="cpu-limit" type="number" value="1000" /></div>
+      <div><label>Memory (Mi)</label><input id="mem-limit" type="number" value="200" /></div>
+    </div>
+    <label>Entrypoint (comma-separated)</label>
+    <input id="entrypoint" value="python3,/usr/local/bin/simpledsapp" />
+    <label>Plugin Args (comma-separated)</label>
+    <input id="plugin-args" value="--prefix,le" />
+    <label>Input Dirs</label>
+    <input id="input-dirs" value="home/user/cube" />
+    <label>Output Dir</label>
+    <input id="output-dir" value="home/user/cube_out" />
+
+    <button class="btn-primary" id="btn-run" onclick="runFullWorkflow()">Run Full Workflow</button>
+    <button class="btn-secondary" onclick="clearLogs()">Clear Logs</button>
+
+    <div id="workflow-steps"></div>
+  </div>
+
+  <!-- Status Panel -->
+  <div class="panel">
+    <h2>Real-time Status Events (SSE)</h2>
+    <div style="margin-bottom:8px">
+      <button class="btn-secondary" id="btn-connect" onclick="connectSSE()">Connect SSE</button>
+      <button class="btn-secondary" onclick="disconnectSSE()">Disconnect</button>
+      <span id="sse-state" style="color:var(--muted);font-size:0.8em;margin-left:8px;">disconnected</span>
+    </div>
+    <div id="status-log"></div>
+  </div>
+
+  <!-- Log Viewer Panel -->
+  <div class="panel full-width">
+    <h2>Real-time Container Logs (SSE)</h2>
+    <div id="event-log"></div>
+  </div>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

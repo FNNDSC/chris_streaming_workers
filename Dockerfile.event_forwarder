@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[event-forwarder]"
+
+COPY chris_streaming/ chris_streaming/
+
+CMD ["python", "-m", "chris_streaming.event_forwarder"]

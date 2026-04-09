@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
+.claude/
+tests/
+config/
+test_ui/
+*.md
