@@ -3,8 +3,9 @@ Entry point for the Status Consumer service.
 
     python -m chris_streaming.status_consumer
 
-Reads job-status-events from Kafka, upserts to PostgreSQL, publishes to
-Redis Pub/Sub, and schedules Celery tasks for terminal statuses.
+Reads job-status-events from Kafka, publishes to Redis Pub/Sub for real-time
+delivery, and schedules Celery tasks for DB persistence and terminal status
+confirmation.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ import structlog
 from chris_streaming.common.kafka import create_consumer, create_producer
 from chris_streaming.common.settings import StatusConsumerSettings
 from .consumer import StatusEventConsumer
-from .db import StatusDB
 from .notifier import StatusNotifier
 
 logger = structlog.get_logger()
@@ -39,11 +39,7 @@ async def main() -> None:
     )
 
     # Initialize components
-    db = StatusDB(settings.db_dsn)
-    await db.connect()
-
-    notifier = StatusNotifier(settings.redis_url, settings.celery_broker_url)
-    await notifier.connect()
+    notifier = StatusNotifier(settings.celery_broker_url)
 
     kafka_consumer = await create_consumer(
         settings,
@@ -55,7 +51,6 @@ async def main() -> None:
 
     consumer = StatusEventConsumer(
         consumer=kafka_consumer,
-        db=db,
         notifier=notifier,
         dlq_producer=dlq_producer,
         dlq_topic=settings.kafka_topic_status_dlq,
@@ -85,8 +80,6 @@ async def main() -> None:
         pass
 
     await consumer.close()
-    await notifier.close()
-    await db.close()
     logger.info("Status Consumer stopped")
 
 

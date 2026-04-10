@@ -1,21 +1,10 @@
-FROM python:3.12-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir --prefix=/install ".[status-consumer]"
-
 FROM python:3.12-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 && \
-    rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-COPY --from=builder /install /usr/local
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[status-consumer]"
+
 COPY chris_streaming/ chris_streaming/
 
 CMD ["python", "-m", "chris_streaming.status_consumer"]

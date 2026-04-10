@@ -47,14 +47,15 @@ class EventForwarderSettings(KafkaSettings):
     kafka_sasl_password: str = "event-forwarder-secret"
     # On startup, emit current state of all matching containers
     emit_initial_state: bool = True
+    # Delay before producing EOS marker (must exceed Fluent Bit flush cycle)
+    eos_delay_seconds: float = 10.0
 
 
-class StatusConsumerSettings(KafkaSettings, RedisSettings):
+class StatusConsumerSettings(KafkaSettings):
     """Status Consumer specific settings."""
     kafka_sasl_username: str = "status-consumer"
     kafka_sasl_password: str = "status-consumer-secret"
     kafka_consumer_group: str = "status-consumer-group"
-    db_dsn: str = "postgresql://chris:chris1234@postgres:5432/chris_streaming"
     max_retries: int = 3
     celery_broker_url: str = "redis://redis:6379/0"
 
@@ -72,9 +73,14 @@ class LogConsumerSettings(KafkaSettings, RedisSettings):
 
 
 class SSEServiceSettings(RedisSettings):
-    """SSE Service specific settings."""
+    """SSE Service and Celery Worker settings."""
     host: str = "0.0.0.0"
     port: int = 8080
     opensearch_url: str = "http://opensearch:9200"
     opensearch_index_prefix: str = "job-logs"
     celery_broker_url: str = "redis://redis:6379/0"
+    db_dsn: str = "postgresql://chris:chris1234@postgres:5432/chris_streaming"
+    # pfcon connection (used by Celery worker for workflow orchestration)
+    pfcon_url: str = "http://pfcon:30005"
+    pfcon_user: str = "pfcon"
+    pfcon_password: str = "pfcon1234"

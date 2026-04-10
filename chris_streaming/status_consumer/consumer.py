@@ -1,8 +1,8 @@
 """
 Kafka consumer for job-status-events.
 
-Reads events, upserts to PostgreSQL, publishes to Redis Pub/Sub,
-and optionally schedules Celery tasks for terminal statuses.
+Reads events, publishes to Redis Pub/Sub, and schedules Celery tasks for
+DB persistence and terminal status confirmation.
 Failed messages are sent to the dead-letter topic after max retries.
 """
 
@@ -12,8 +12,7 @@ import logging
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
-from chris_streaming.common.schemas import StatusEvent, kafka_key_for_job
-from .db import StatusDB
+from chris_streaming.common.schemas import StatusEvent
 from .notifier import StatusNotifier
 
 logger = logging.getLogger(__name__)
@@ -25,14 +24,12 @@ class StatusEventConsumer:
     def __init__(
         self,
         consumer: AIOKafkaConsumer,
-        db: StatusDB,
         notifier: StatusNotifier,
         dlq_producer: AIOKafkaProducer,
         dlq_topic: str,
         max_retries: int = 3,
     ):
         self._consumer = consumer
-        self._db = db
         self._notifier = notifier
         self._dlq_producer = dlq_producer
         self._dlq_topic = dlq_topic
@@ -63,7 +60,6 @@ class StatusEventConsumer:
         """Process a single event with retry logic."""
         for attempt in range(1, self._max_retries + 1):
             try:
-                await self._db.upsert(event)
                 await self._notifier.notify(event)
                 logger.info(
                     "Processed event: job=%s type=%s status=%s",

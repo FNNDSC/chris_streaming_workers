@@ -61,10 +61,13 @@ acl() {
         --add "$@"
 }
 
-# event-forwarder: writes to job-status-events
+# event-forwarder: writes to job-status-events and job-logs (EOS markers)
 acl --allow-principal "User:event-forwarder" \
     --operation Write --operation Describe \
     --topic "job-status-events"
+acl --allow-principal "User:event-forwarder" \
+    --operation Write --operation Describe \
+    --topic "job-logs"
 
 # log-producer: writes to job-logs (used by Fluent Bit)
 acl --allow-principal "User:log-producer" \

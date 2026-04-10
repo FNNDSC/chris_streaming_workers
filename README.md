@@ -6,30 +6,44 @@ Event-driven streaming workers that replace ChRIS CUBE's polling-based job obser
 
 In the current ChRIS architecture, CUBE polls pfcon every 5 seconds for every active plugin instance to check status and retrieve logs. This generates O(N) API calls per poll cycle (where N = active jobs), producing excessive database queries, enqueued Celery tasks, and heavy pressure on the Kubernetes/Docker API.
 
-This repository introduces a push-based alternative with two separate pipelines:
+This repository introduces a push-based alternative with two separate pipelines and event-driven workflow orchestration:
 
 **Event Pipeline** (status changes):
 ```
-Docker/K8s Runtime → Event Forwarder → Kafka [job-status-events] → Status Consumer → PostgreSQL + Redis Pub/Sub + Celery
+Docker/K8s Runtime → Event Forwarder → Kafka [job-status-events] → Status Consumer → Celery → Celery Worker → PostgreSQL + Redis Pub/Sub
 ```
 
 **Log Pipeline** (container output):
 ```
 Docker/K8s Runtime → Fluent Bit → Kafka [job-logs] → Log Consumer → OpenSearch + Redis Pub/Sub
+Event Forwarder → (delayed EOS marker) → Kafka [job-logs] → Log Consumer → Redis logs_flushed key
 ```
 
-Both pipelines feed into a real-time streaming layer:
+**Workflow Orchestration** (job lifecycle):
+```
+UI → POST /api/jobs/{id}/run → SSE Service → Celery start_workflow → pfcon (copy)
+                                                    ↓
+Docker events → Event Forwarder → Kafka → Status Consumer → Celery process_job_status
+                                                    ↓
+                                          Workflow state machine:
+                                          copy → plugin → upload → delete → cleanup → completed
+                                                    ↓
+                                          cleanup_containers waits for logs_flushed → pfcon DELETE
+```
+
+Both pipelines feed into a real-time streaming layer with historical replay:
 ```
 Redis Pub/Sub → SSE Service → Browser (EventSource)
+PostgreSQL + OpenSearch → SSE Service → Browser (historical replay on connect)
 ```
 
 ### The three core workers
 
-- **Event Forwarder** (`compute_event_forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. Stateless, idempotent, restart-safe with auto-reconnect.
+- **Event Forwarder** (`compute_event_forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic so the Log Consumer knows when all logs for a container have been flushed. Stateless, idempotent, restart-safe with auto-reconnect.
 
-- **Status Consumer** (`compute_status_consumer`) — Kafka consumer that reads status events, upserts them to PostgreSQL, publishes to Redis Pub/Sub for real-time delivery, and schedules Celery confirmation tasks for terminal statuses. Failed messages go to a dead-letter topic after configurable retries.
+- **Status Consumer** (`compute_status_consumer`) — Kafka consumer that reads status events and schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Failed messages go to a dead-letter topic after configurable retries.
 
-- **Log Consumer** (`compute_logs_consumer`) — Batched Kafka consumer that reads log events (produced by Fluent Bit), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. Configurable batch size and flush interval.
+- **Log Consumer** (`compute_logs_consumer`) — Batched Kafka consumer that reads log events (produced by Fluent Bit and EOS markers from Event Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker is received, flushes the current batch and sets a Redis key (`job:{id}:{type}:logs_flushed`) to signal that all logs have been written to OpenSearch. Configurable batch size and flush interval.
 
 ### Supporting components
 
@@ -39,11 +53,11 @@ The repository also includes supporting infrastructure and a pilot test environm
 - **Fluent Bit** reading Docker container logs, filtering by ChRIS labels, and forwarding to Kafka
 - **OpenSearch** for log storage and historical replay
 - **Redis** for Pub/Sub fan-out and Celery broker
-- **PostgreSQL** for durable status tracking
-- **SSE Service** (pilot FastAPI app) that subscribes to Redis and streams events to browsers
-- **Celery Worker** that processes terminal status confirmations
+- **PostgreSQL** for durable status tracking (written by the Celery Worker)
+- **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/OpenSearch on connect, and exposes REST endpoints for workflow submission and status queries
+- **Celery Worker** that processes status confirmations, orchestrates the workflow state machine (copy → plugin → upload → delete → cleanup), calls pfcon to advance steps, and waits for log flush before container cleanup
 - **pfcon** (`ghcr.io/fnndsc/pfcon:latest`, which includes `org.chrisproject.job_type` labels) as the job control plane
-- **Test UI** for submitting jobs to pfcon and watching status + logs stream in real-time
+- **Test UI** for submitting jobs via the SSE service and watching status + logs stream in real-time
 
 For a detailed view of all data flows, message schemas, Kafka topic design, resilience properties, and the confirmed status flow, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -74,19 +88,19 @@ chris_streaming_workers/
 │   │   ├── pfcon_status.py                     # Docker/K8s state → pfcon JobStatus mapping
 │   │   └── container_naming.py                 # job_id ↔ container_name parsing
 │   │
-│   ├── event_forwarder/                        # Produces to job-status-events
+│   ├── event_forwarder/                        # Produces to job-status-events + EOS markers
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.event_forwarder
 │   │   ├── watcher.py                          # Abstract async watcher protocol
 │   │   ├── docker_watcher.py                   # Docker event stream → StatusEvent
 │   │   ├── k8s_watcher.py                      # K8s Job watch API → StatusEvent
-│   │   └── producer.py                         # Kafka producer with idempotence + dedup
+│   │   ├── producer.py                         # Kafka producer with idempotence + dedup
+│   │   └── eos_producer.py                     # Delayed EOS markers → Kafka job-logs
 │   │
 │   ├── status_consumer/                        # Consumes job-status-events
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.status_consumer
 │   │   ├── consumer.py                         # Kafka consumer with retry + DLQ
-│   │   ├── db.py                               # asyncpg PostgreSQL upserts + schema
 │   │   └── notifier.py                         # Redis Pub/Sub + Celery task scheduling
 │   │
 │   ├── log_consumer/                           # Consumes job-logs
@@ -96,13 +110,14 @@ chris_streaming_workers/
 │   │   ├── opensearch_writer.py                # Bulk writes with daily index rotation
 │   │   └── redis_publisher.py                  # Per-job Pub/Sub fan-out
 │   │
-│   └── sse_service/                            # Pilot FastAPI SSE service
+│   └── sse_service/                            # FastAPI SSE service + Celery tasks
 │       ├── __init__.py
 │       ├── __main__.py                         # python -m chris_streaming.sse_service
 │       ├── app.py                              # FastAPI app with CORS
-│       ├── routes.py                           # SSE + history endpoints
-│       ├── redis_subscriber.py                 # Async Redis subscriber per SSE connection
-│       └── tasks.py                            # Celery confirm_job_status task
+│       ├── routes.py                           # SSE + REST endpoints (run, workflow, history)
+│       ├── redis_subscriber.py                 # Async Redis subscriber with historical replay
+│       ├── pfcon_client.py                     # Synchronous HTTP client for pfcon REST API
+│       └── tasks.py                            # Celery tasks: process_job_status, start_workflow, cleanup_containers
 │
 ├── config/
 │   ├── kafka/
@@ -123,7 +138,7 @@ chris_streaming_workers/
 │   ├── nginx.conf                              # Proxy /pfcon/ → pfcon, /sse/ → SSE service
 │   └── static/
 │       ├── index.html                          # Job submission + status + log viewer
-│       └── app.js                              # pfcon client + EventSource SSE client
+│       └── app.js                              # SSE service client + EventSource SSE client
 │
 └── tests/
     └── __init__.py
@@ -139,15 +154,15 @@ All 14 services run on a single `streaming` Docker network.
 | 2 | `kafka-init` | `apache/kafka:3.9.0` | Creates topics and ACLs (run-once) | — |
 | 3 | `opensearch` | `opensearchproject/opensearch:2.18.0` | Log storage and search | 9200 |
 | 4 | `redis` | `redis:7-alpine` | Pub/Sub fan-out + Celery broker | 6379 |
-| 5 | `postgres` | `postgres:16-alpine` | Status consumer DB | 5433 |
+| 5 | `postgres` | `postgres:16-alpine` | Celery worker DB | 5433 |
 | 6 | `fluent-bit` | `fluent/fluent-bit:3.2` | Docker log files → Kafka `job-logs` | 2020 (metrics) |
 | 7 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
 | 8 | `init-test-data` | `alpine:latest` | Creates sample fslink test data (run-once) | — |
 | 9 | `event-forwarder` | `localhost/fnndsc/compute_event_forwarder` | Docker events → Kafka `job-status-events` | — |
-| 10 | `status-consumer` | `localhost/fnndsc/compute_status_consumer` | Kafka → PostgreSQL + Redis + Celery | — |
+| 10 | `status-consumer` | `localhost/fnndsc/compute_status_consumer` | Kafka → Celery | — |
 | 11 | `log-consumer` | `localhost/fnndsc/compute_logs_consumer` | Kafka → OpenSearch + Redis | — |
 | 12 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming | 8080 |
-| 13 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery confirmation tasks | — |
+| 13 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
 | 14 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
 
 ### Dependency graph
@@ -155,12 +170,12 @@ All 14 services run on a single `streaming` Docker network.
 ```
 init-test-data ──→ pfcon
 kafka ──→ kafka-init ──→ event-forwarder
-                     ├──→ status-consumer (also needs postgres, redis)
+                     ├──→ status-consumer
                      ├──→ log-consumer    (also needs opensearch, redis)
                      └──→ fluent-bit
-redis ──→ sse-service
-      ──→ celery-worker
-pfcon + sse-service ──→ test-ui
+redis + postgres + pfcon ──→ celery-worker
+redis + postgres ──→ sse-service
+sse-service ──→ test-ui
 ```
 
 ### Kafka design
@@ -174,7 +189,7 @@ pfcon + sse-service ──→ test-ui
 
 Partitioning by `job_id` guarantees ordering of all events for a single job.
 
-SASL/PLAIN users (defined in `kafka_server_jaas.conf`): `event-forwarder` (write events), `log-producer` (Fluent Bit writes logs), `status-consumer` (read events), `log-consumer` (read logs). Each user has ACLs restricting them to only the operations they need.
+SASL/PLAIN users (defined in `kafka_server_jaas.conf`): `event-forwarder` (write events + write EOS markers to job-logs), `log-producer` (Fluent Bit writes logs), `status-consumer` (read events), `log-consumer` (read logs). Each user has ACLs restricting them to only the operations they need.
 
 ## Development and testing
 
@@ -198,8 +213,12 @@ This builds the custom service images, pulls infrastructure images (including pf
 |-----|---------|
 | http://localhost:8888 | Test UI — submit jobs, watch status + logs |
 | http://localhost:8080/health | SSE Service health check |
-| http://localhost:8080/events/{job_id}/status | SSE status stream (direct) |
-| http://localhost:8080/events/{job_id}/logs | SSE log stream (direct) |
+| http://localhost:8080/api/jobs/{job_id}/run | Submit a workflow (POST) |
+| http://localhost:8080/api/jobs/{job_id}/workflow | Workflow status (GET) |
+| http://localhost:8080/api/jobs/{job_id}/status/history | Status history (GET) |
+| http://localhost:8080/events/{job_id}/status | SSE status stream (with historical replay) |
+| http://localhost:8080/events/{job_id}/logs | SSE log stream (with historical replay) |
+| http://localhost:8080/events/{job_id}/all | SSE combined stream (with historical replay) |
 | http://localhost:8080/logs/{job_id}/history | Historical logs from OpenSearch |
 | http://localhost:30005/api/v1/ | pfcon API (direct) |
 | http://localhost:9200 | OpenSearch API |
@@ -209,35 +228,33 @@ This builds the custom service images, pulls infrastructure images (including pf
 1. Open http://localhost:8888
 2. The form is pre-filled with defaults for `pl-simpledsapp` against the test data
 3. Click **Run Full Workflow** — the UI will:
-   - Authenticate with pfcon
-   - Schedule copy → poll → schedule plugin → poll → get files → upload (no-op) → delete → cleanup
+   - Submit a single `POST /sse/api/jobs/{job_id}/run` request to the SSE service
+   - The SSE service schedules the workflow via Celery, which orchestrates copy → plugin → upload → delete → cleanup automatically
 4. Watch the **Status Events** panel for real-time SSE status updates from the event pipeline
 5. Watch the **Container Logs** panel for real-time log lines from the log pipeline
+6. Watch the **Step Tracker** for workflow progression
 
 ### Run a test job via curl
 
 ```bash
-# Authenticate
-TOKEN=$(curl -s -X POST http://localhost:30005/api/v1/auth-token/ \
+# Submit a workflow (single request — the SSE service orchestrates everything)
+curl -s -X POST http://localhost:8080/api/jobs/my-job-1/run \
   -H 'Content-Type: application/json' \
-  -d '{"pfcon_user":"pfcon","pfcon_password":"pfcon1234"}' | jq -r '.token')
+  -d '{
+    "image": "ghcr.io/fnndsc/pl-simpledsapp:2.1.0",
+    "entrypoint": ["simpledsapp"],
+    "type": "ds",
+    "args": ["--dummyFloat", "3.5", "--sleepLength", "5"]
+  }'
 
-# Schedule copy
-curl -s -X POST http://localhost:30005/api/v1/copyjobs/ \
-  -H "Authorization: Bearer $TOKEN" \
-  -d 'jid=test-job-1&input_dirs=home/user/cube&output_dir=home/user/cube_out'
+# Check workflow status
+curl -s http://localhost:8080/api/jobs/my-job-1/workflow | jq
 
-# Poll copy until finishedSuccessfully
-curl -s http://localhost:30005/api/v1/copyjobs/test-job-1/ \
-  -H "Authorization: Bearer $TOKEN"
+# Get status history
+curl -s http://localhost:8080/api/jobs/my-job-1/status/history | jq
 
-# Schedule plugin
-curl -s -X POST http://localhost:30005/api/v1/pluginjobs/ \
-  -H "Authorization: Bearer $TOKEN" \
-  -d 'jid=test-job-1&args=--prefix&args=le&auid=cube&number_of_workers=1&cpu_limit=1000&memory_limit=200&gpu_limit=0&image=fnndsc/pl-simpledsapp&entrypoint=python3&entrypoint=/usr/local/bin/simpledsapp&type=ds&input_dirs=home/user/cube&output_dir=home/user/cube_out'
-
-# Meanwhile, stream SSE events in another terminal:
-curl -N http://localhost:8080/events/test-job-1/all
+# Stream SSE events (including historical replay for late-connecting clients)
+curl -N http://localhost:8080/events/my-job-1/all
 ```
 
 ### Inspect the pipeline internals
@@ -318,6 +335,7 @@ Used by: Event Forwarder, Status Consumer, Log Consumer
 | `K8S_NAMESPACE` | `default` | Kubernetes namespace (when `COMPUTE_ENV=kubernetes`) |
 | `K8S_LABEL_SELECTOR` | `org.chrisproject.miniChRIS=plugininstance` | K8s label selector |
 | `EMIT_INITIAL_STATE` | `true` | Emit current state of all containers on startup |
+| `EOS_DELAY_SECONDS` | `10.0` | Delay before sending EOS marker to job-logs (seconds) |
 | `KAFKA_SASL_USERNAME` | `event-forwarder` | Kafka SASL/PLAIN user |
 | `KAFKA_SASL_PASSWORD` | `event-forwarder-secret` | Kafka SASL/PLAIN password |
 
@@ -330,8 +348,6 @@ Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in
 | `KAFKA_SASL_USERNAME` | `status-consumer` | Kafka SASL/PLAIN user |
 | `KAFKA_SASL_PASSWORD` | `status-consumer-secret` | Kafka SASL/PLAIN password |
 | `KAFKA_CONSUMER_GROUP` | `status-consumer-group` | Kafka consumer group ID |
-| `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for Pub/Sub |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker URL |
 | `MAX_RETRIES` | `3` | Retries before sending to DLQ |
 
@@ -355,19 +371,27 @@ Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in
 | `PORT` | `8080` | Bind port |
 | `REDIS_URL` | `redis://redis:6379/0` | Redis URL for Pub/Sub subscriptions |
 | `OPENSEARCH_URL` | `http://opensearch:9200` | OpenSearch for historical log queries |
-| `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker for the confirmation worker |
+| `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker |
+| `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
+| `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |
+| `PFCON_USER` | `pfcon` | pfcon API username |
+| `PFCON_PASSWORD` | `pfcon1234` | pfcon API password |
 
 ### Celery Worker
 
 Uses the same image as SSE Service. Runs with:
 ```
-celery -A chris_streaming.sse_service.tasks worker -l info -Q confirmation -c 2
+celery -A chris_streaming.sse_service.tasks worker -l info -Q status-processing -c 2
 ```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for publishing confirmed statuses |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for publishing confirmed statuses and checking logs_flushed keys |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker |
+| `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
+| `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |
+| `PFCON_USER` | `pfcon` | pfcon API username |
+| `PFCON_PASSWORD` | `pfcon1234` | pfcon API password |
 
 ### Fluent Bit
 
@@ -400,7 +424,7 @@ Requires `/var/lib/docker/containers` and `/var/run/docker.sock` mounted read-on
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POSTGRES_DB` | `chris_streaming` | Database name |
+| `POSTGRES_DB` | `chris_streaming` | Database name (used by Celery Worker) |
 | `POSTGRES_USER` | `chris` | Database user |
 | `POSTGRES_PASSWORD` | `chris1234` | Database password |
 

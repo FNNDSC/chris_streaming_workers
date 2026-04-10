@@ -56,9 +56,11 @@ async def main() -> None:
         consumer=kafka_consumer,
         opensearch=opensearch,
         redis_pub=redis_pub,
+        redis_url=settings.redis_url,
         batch_max_size=settings.batch_max_size,
         batch_max_wait_seconds=settings.batch_max_wait_seconds,
     )
+    await consumer.connect_redis()
 
     # Graceful shutdown
     shutdown_event = asyncio.Event()

@@ -23,7 +23,7 @@ import aiodocker
 
 from chris_streaming.common.container_naming import resolve_job_type
 from chris_streaming.common.pfcon_status import docker_event_to_status, docker_state_to_status
-from chris_streaming.common.schemas import StatusEvent, JobStatus
+from chris_streaming.common.schemas import StatusEvent
 from chris_streaming.common.settings import EventForwarderSettings
 from .watcher import Watcher
 

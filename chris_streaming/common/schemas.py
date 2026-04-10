@@ -9,7 +9,6 @@ Both are used for Kafka serialization/deserialization by all three services.
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
@@ -87,8 +86,9 @@ class LogEvent(BaseModel):
     job_id: str
     job_type: JobType
     container_name: str = ""
-    line: str
+    line: str = ""
     stream: str = "stdout"
+    eos: bool = False
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_serializer("timestamp")

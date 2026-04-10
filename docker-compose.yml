@@ -116,7 +116,7 @@ services:
     networks:
       - streaming
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chris}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chris} -d ${POSTGRES_DB:-chris_streaming}"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -219,7 +219,7 @@ services:
       - streaming
     restart: unless-stopped
 
-  # ---------- Status Consumer (Kafka -> PostgreSQL + Redis + Celery) ----------
+  # ---------- Status Consumer (Kafka -> Celery) ----------
   status-consumer:
     build:
       context: .
@@ -232,17 +232,11 @@ services:
       KAFKA_SASL_USERNAME: status-consumer
       KAFKA_SASL_PASSWORD: ${STATUS_CONSUMER_PASSWORD:-status-consumer-secret}
       KAFKA_CONSUMER_GROUP: status-consumer-group
-      DB_DSN: postgresql://${POSTGRES_USER:-chris}:${POSTGRES_PASSWORD:-chris1234}@postgres:5432/${POSTGRES_DB:-chris_streaming}
-      REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
       MAX_RETRIES: "3"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     networks:
       - streaming
     restart: unless-stopped
@@ -284,6 +278,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       OPENSEARCH_URL: http://opensearch:9200
       CELERY_BROKER_URL: redis://redis:6379/0
+      DB_DSN: postgresql://${POSTGRES_USER:-chris}:${POSTGRES_PASSWORD:-chris1234}@postgres:5432/${POSTGRES_DB:-chris_streaming}
+      PFCON_URL: http://pfcon:30005
+      PFCON_USER: ${PFCON_USER:-pfcon}
+      PFCON_PASSWORD: ${PFCON_PASSWORD:-pfcon1234}
       HOST: "0.0.0.0"
       PORT: "8080"
     ports:
@@ -293,22 +291,32 @@ services:
         condition: service_healthy
       opensearch:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     networks:
       - streaming
     restart: unless-stopped
 
-  # ---------- Celery Worker (confirmation tasks) ----------
+  # ---------- Celery Worker (status processing + workflow orchestration) ----------
   celery-worker:
     build:
       context: .
       dockerfile: Dockerfile.sse_service
-    command: celery -A chris_streaming.sse_service.tasks worker -l info -Q confirmation -c 2
+    command: celery -A chris_streaming.sse_service.tasks worker -l info -Q status-processing -c 2
     environment:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/0
+      DB_DSN: postgresql://${POSTGRES_USER:-chris}:${POSTGRES_PASSWORD:-chris1234}@postgres:5432/${POSTGRES_DB:-chris_streaming}
+      PFCON_URL: http://pfcon:30005
+      PFCON_USER: ${PFCON_USER:-pfcon}
+      PFCON_PASSWORD: ${PFCON_PASSWORD:-pfcon1234}
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      pfcon:
+        condition: service_started
     networks:
       - streaming
     restart: unless-stopped
