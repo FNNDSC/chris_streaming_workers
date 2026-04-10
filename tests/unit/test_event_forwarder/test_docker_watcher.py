@@ -1,7 +1,7 @@
 """Tests for chris_streaming.event_forwarder.docker_watcher."""
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 from chris_streaming.common.schemas import JobStatus, JobType
 from chris_streaming.common.settings import EventForwarderSettings

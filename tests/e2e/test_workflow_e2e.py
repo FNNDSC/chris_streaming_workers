@@ -360,7 +360,7 @@ class TestWorkflowFailureE2E:
             )
         history = resp.json()
         assert len(history["statuses"]) > 0, (
-            f"Expected status history records for failed workflow"
+            "Expected status history records for failed workflow"
         )
 
 

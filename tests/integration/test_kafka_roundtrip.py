@@ -1,6 +1,5 @@
 """Integration test: produce and consume messages through real Kafka."""
 
-import asyncio
 import uuid
 
 import pytest

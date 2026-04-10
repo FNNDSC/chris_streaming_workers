@@ -1,12 +1,7 @@
 """Tests for chris_streaming.sse_service.tasks (unit tests with mocked dependencies)."""
 
 import json
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch, call
-
-import pytest
-
-from chris_streaming.common.schemas import JobStatus, JobType, StatusEvent
+from unittest.mock import MagicMock, patch
 
 
 # We need to mock the DB and Redis pools before importing the tasks module

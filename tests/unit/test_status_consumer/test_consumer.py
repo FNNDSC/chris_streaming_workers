@@ -1,12 +1,9 @@
 """Tests for chris_streaming.status_consumer.consumer."""
 
-import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
-import pytest
-
-from chris_streaming.common.schemas import StatusEvent, JobStatus, JobType
+from chris_streaming.common.schemas import StatusEvent
 from chris_streaming.status_consumer.consumer import StatusEventConsumer
 
 

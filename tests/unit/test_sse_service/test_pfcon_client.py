@@ -1,9 +1,6 @@
 """Tests for chris_streaming.sse_service.pfcon_client."""
 
-from unittest.mock import MagicMock, patch
-
-import pytest
-import requests
+from unittest.mock import MagicMock
 
 from chris_streaming.sse_service.pfcon_client import PfconClient
 

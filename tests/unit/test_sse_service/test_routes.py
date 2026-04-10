@@ -1,6 +1,6 @@
 """Tests for chris_streaming.sse_service.routes."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient

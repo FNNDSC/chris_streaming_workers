@@ -1,8 +1,7 @@
 """Tests for chris_streaming.log_consumer.consumer."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
-from chris_streaming.common.schemas import JobType, LogEvent
 from chris_streaming.log_consumer.consumer import LogEventConsumer
 
 
