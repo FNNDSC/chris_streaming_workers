@@ -46,6 +46,9 @@ all = [
 dev = [
     "pytest>=8,<9",
     "pytest-asyncio>=0.24,<1",
+    "pytest-mock>=3.14,<4",
+    "httpx>=0.27,<1",
+    "respx>=0.22,<1",
     "ruff>=0.8,<1",
 ]
 
@@ -62,3 +65,7 @@ target-version = "py312"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: marks tests that require Docker Compose infrastructure (deselect with '-m \"not integration\"')",
+    "e2e: marks end-to-end tests that require the full stack (all services running)",
+]

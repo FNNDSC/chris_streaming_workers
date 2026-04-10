@@ -201,8 +201,12 @@ SASL/PLAIN users (defined in `kafka_server_jaas.conf`): `event-forwarder` (write
 ### Start everything
 
 ```bash
-cd /path/to/chris_streaming_workers
-docker compose up --build
+just up
+```
+
+or without just:
+```bash
+docker compose up --build -d
 ```
 
 This builds the custom service images, pulls infrastructure images (including pfcon), initializes Kafka topics/users, creates test data, and launches all services.
@@ -285,25 +289,83 @@ curl -s http://localhost:2020/api/v1/metrics
 ### Stop and clean up
 
 ```bash
-docker compose down           # stop services
-docker compose down -v        # stop and remove all volumes (full reset)
+just down              # stop services
+just nuke              # stop and remove all volumes (full reset)
 ```
 
-### Local Python development
+or without just:
+```bash
+docker compose down    # stop services
+docker compose down -v # stop and remove all volumes (full reset)
+```
 
-For working on the Python code outside Docker:
+### Running automated tests
+
+Tests are split into three levels — **unit tests** (no infrastructure, fast), **integration tests** (require Kafka, Redis, OpenSearch, PostgreSQL), and **end-to-end tests** (require the full application stack). All run entirely in Docker via `docker-compose.test.yml` and `Dockerfile.test`, using Docker Compose profiles to start only the services needed for each level.
+
+#### Using `just` (recommended)
+
+Install [just](https://github.com/casey/just), then:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[all,dev]"
+# Run unit tests (no infrastructure needed, ~1s)
+just run unit-tests
 
-# Run linter
-ruff check chris_streaming/
+# Run integration tests (spins up Kafka, Redis, OpenSearch, PostgreSQL)
+just run integration-tests
 
-# Run tests (requires infrastructure services running)
-pytest tests/
+# Run E2E tests (starts full application stack, submits real workflows)
+just run e2e-tests
+
+# Run all test levels sequentially (useful for CI/CD)
+just run all-tests
 ```
+
+#### Using Docker Compose directly
+
+```bash
+# Unit tests only
+docker compose -f docker-compose.test.yml build unit-tests
+docker compose -f docker-compose.test.yml run --rm unit-tests
+
+# Integration tests (starts infrastructure, runs tests, stops infrastructure)
+docker compose -f docker-compose.test.yml --profile integration build
+docker compose -f docker-compose.test.yml --profile integration up -d --wait
+docker compose -f docker-compose.test.yml run --rm integration-tests
+docker compose -f docker-compose.test.yml --profile integration down
+
+# E2E tests (requires the full stack from docker-compose.yml)
+docker compose up --build -d
+docker compose -f docker-compose.test.yml build e2e-tests
+docker compose -f docker-compose.test.yml --profile e2e run --rm e2e-tests
+docker compose down
+```
+
+#### Test structure
+
+```
+tests/
+├── conftest.py                           # Shared fixtures (sample events)
+├── unit/                                 # No external services required
+│   ├── test_common/                      # schemas, pfcon_status, container_naming, settings, kafka
+│   ├── test_event_forwarder/             # producer, eos_producer, docker_watcher
+│   ├── test_status_consumer/             # consumer, notifier
+│   ├── test_log_consumer/                # consumer, opensearch_writer, redis_publisher
+│   └── test_sse_service/                 # app, routes, pfcon_client, tasks
+├── integration/                          # Requires Docker Compose infrastructure
+│   ├── test_kafka_roundtrip.py           # Produce/consume through real Kafka
+│   ├── test_redis_pubsub.py             # Pub/Sub and key operations
+│   ├── test_opensearch_writer.py         # Bulk writes and queries
+│   ├── test_postgres.py                  # Schema creation and upsert logic
+│   └── test_sse_health.py               # FastAPI health endpoint
+└── e2e/                                  # Requires full application stack
+    └── test_workflow_e2e.py              # Submit workflows, verify SSE events + logs
+```
+
+- **Unit tests** use mocks exclusively — no network or container dependencies.
+- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Kafka produce/consume, Redis Pub/Sub, OpenSearch bulk writes, PostgreSQL upserts).
+- **E2E tests** are marked with `@pytest.mark.e2e` and exercise the full pipeline: submit a job via `POST /api/jobs/{id}/run`, verify status events arrive through the SSE stream, check workflow completion, and confirm logs appear in OpenSearch. Includes tests for successful workflows, failure scenarios (bad image), and historical replay for late-connecting SSE clients.
+
 
 ## Configuration
 

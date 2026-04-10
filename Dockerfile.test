@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[all,dev]"
+
+COPY chris_streaming/ chris_streaming/
+COPY tests/ tests/
+
+ENTRYPOINT ["pytest"]
+CMD ["-v", "--tb=short"]
