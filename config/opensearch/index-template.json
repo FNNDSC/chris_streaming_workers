@@ -9,6 +9,9 @@
     },
     "mappings": {
       "properties": {
+        "event_id": {
+          "type": "keyword"
+        },
         "job_id": {
           "type": "keyword"
         },

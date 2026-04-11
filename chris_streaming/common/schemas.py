@@ -83,6 +83,7 @@ class StatusEvent(BaseModel):
 
 class LogEvent(BaseModel):
     """A single log line from a container, produced by Fluent Bit or the Event Forwarder."""
+    event_id: str = ""
     job_id: str
     job_type: JobType
     container_name: str = ""
@@ -94,6 +95,14 @@ class LogEvent(BaseModel):
     @field_serializer("timestamp")
     def serialize_timestamp(self, v: datetime, _info) -> str:
         return v.isoformat()
+
+    def model_post_init(self, __context) -> None:
+        if not self.event_id:
+            raw = (
+                f"{self.job_id}:{self.job_type.value}:{self.container_name}:"
+                f"{self.stream}:{self.timestamp}:{self.line}"
+            )
+            self.event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
 
     def serialize_for_kafka(self) -> bytes:
         return self.model_dump_json().encode("utf-8")

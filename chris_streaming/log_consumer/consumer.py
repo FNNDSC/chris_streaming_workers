@@ -99,6 +99,13 @@ class LogEventConsumer:
 
             if should_flush:
                 if batch:
+                    # Sort by timestamp so OpenSearch insertion order and the
+                    # live Redis fan-out are both chronological. Fluent Bit
+                    # tails multiple container files concurrently and does
+                    # not guarantee temporal ordering across them, so logs
+                    # from e.g. the copy and plugin containers can arrive
+                    # interleaved within one Kafka batch.
+                    batch.sort(key=lambda e: e.timestamp)
                     try:
                         await self._flush(batch)
                     except Exception as e:

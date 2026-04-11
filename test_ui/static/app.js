@@ -47,6 +47,11 @@ function ts() {
 
 const STEPS = ['copy', 'plugin', 'upload', 'delete', 'cleanup', 'completed'];
 
+const WORKFLOW_TERMINAL = new Set([
+    'finishedSuccessfully', 'finishedWithError', 'failed'
+]);
+const WORKFLOW_NON_SUCCESS = new Set(['finishedWithError', 'failed']);
+
 function updateStepTracker(currentStep, workflowStatus) {
     const el = document.getElementById('workflow-steps');
     if (!el.children.length) {
@@ -54,15 +59,16 @@ function updateStepTracker(currentStep, workflowStatus) {
             `<div class="step" id="step-${i}">${i + 1}. ${s}</div>`
         ).join('');
     }
+    const isNonSuccess = WORKFLOW_NON_SUCCESS.has(workflowStatus);
     for (let i = 0; i < STEPS.length; i++) {
         const stepEl = document.getElementById(`step-${i}`);
         if (!stepEl) continue;
         if (STEPS[i] === currentStep) {
-            stepEl.className = workflowStatus === 'failed' ? 'step error' : 'step active';
+            stepEl.className = isNonSuccess ? 'step error' : 'step active';
         } else if (i < STEPS.indexOf(currentStep)) {
             stepEl.className = 'step done';
         } else if (currentStep === 'completed') {
-            stepEl.className = workflowStatus === 'failed' ? 'step error' : 'step done';
+            stepEl.className = isNonSuccess ? 'step error' : 'step done';
         } else {
             stepEl.className = 'step';
         }
@@ -205,15 +211,15 @@ function startWorkflowPolling(jid) {
 
             updateStepTracker(data.current_step, data.status);
 
-            if (data.current_step === 'completed' || data.status === 'failed') {
+            if (data.current_step === 'completed' || WORKFLOW_TERMINAL.has(data.status)) {
                 clearInterval(workflowPollInterval);
                 workflowPollInterval = null;
 
-                const label = data.status === 'failed' ? 'failed' : 'completed';
-                const color = data.status === 'failed' ? 'var(--err)' : 'var(--ok)';
+                const isNonSuccess = WORKFLOW_NON_SUCCESS.has(data.status);
+                const color = isNonSuccess ? 'var(--err)' : 'var(--ok)';
                 appendStatus(
                     `${ts()} <strong style="color:${color}">` +
-                    `Workflow ${label}!</strong>`
+                    `Workflow ${data.status}!</strong>`
                 );
             }
         } catch { /* ignore poll errors */ }

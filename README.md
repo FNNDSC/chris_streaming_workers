@@ -39,7 +39,7 @@ PostgreSQL + OpenSearch → SSE Service → Browser (historical replay on connec
 
 ### The three core workers
 
-- **Event Forwarder** (`compute_event_forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic so the Log Consumer knows when all logs for a container have been flushed. Stateless, idempotent, restart-safe with auto-reconnect.
+- **Event Forwarder** (`compute_event_forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic as a best-effort hint that Fluent Bit has flushed all logs for a container (see the EOS section in [ARCHITECTURE.md](ARCHITECTURE.md) — cleanup does not depend on this alone). Stateless, idempotent, restart-safe with auto-reconnect.
 
 - **Status Consumer** (`compute_status_consumer`) — Kafka consumer that reads status events and schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Failed messages go to a dead-letter topic after configurable retries.
 
@@ -55,7 +55,7 @@ The repository also includes supporting infrastructure and a pilot test environm
 - **Redis** for Pub/Sub fan-out and Celery broker
 - **PostgreSQL** for durable status tracking (written by the Celery Worker)
 - **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/OpenSearch on connect, and exposes REST endpoints for workflow submission and status queries
-- **Celery Worker** that processes status confirmations, orchestrates the workflow state machine (copy → plugin → upload → delete → cleanup), calls pfcon to advance steps, and waits for log flush before container cleanup
+- **Celery Worker** that processes status confirmations, orchestrates the workflow state machine (copy → plugin → upload → delete → cleanup), calls pfcon to advance steps, honours pfcon's `requires_copy_job` / `requires_upload_job` flags to skip optional steps, and waits for log flush (or terminal-status quiescence) before container cleanup. At cleanup time it computes the overall workflow status (`finishedSuccessfully`, `finishedWithError`, or `failed`) from the recorded per-step outcomes.
 - **pfcon** (`ghcr.io/fnndsc/pfcon:latest`, which includes `org.chrisproject.job_type` labels) as the job control plane
 - **Test UI** for submitting jobs via the SSE service and watching status + logs stream in real-time
 
@@ -438,6 +438,7 @@ Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in
 | `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |
 | `PFCON_USER` | `pfcon` | pfcon API username |
 | `PFCON_PASSWORD` | `pfcon1234` | pfcon API password |
+| `EOS_QUIESCENCE_SECONDS` | `10.0` | Fallback window used by `cleanup_containers`: if no `logs_flushed` key appears, a step whose terminal status has been stable for this long is treated as drained. EOS is a hint, not a hard gate. |
 
 ### Celery Worker
 

@@ -148,3 +148,314 @@ class TestWorkflowStepMappings:
         assert _FAILURE_STEP["plugin"] == "delete"
         assert _FAILURE_STEP["upload"] == "delete"
         assert "delete" not in _FAILURE_STEP
+
+
+class TestStepSkipHelpers:
+    """Tests for _is_step_required / _first_active_step / _next_active_step."""
+
+    def test_is_step_required_defaults_true_when_flag_missing(self):
+        from chris_streaming.sse_service.tasks import _is_step_required
+        assert _is_step_required("copy", {}) is True
+        assert _is_step_required("upload", {}) is True
+
+    def test_is_step_required_honours_flag(self):
+        from chris_streaming.sse_service.tasks import _is_step_required
+        assert _is_step_required("copy", {"requires_copy_job": False}) is False
+        assert _is_step_required("upload", {"requires_upload_job": False}) is False
+        assert _is_step_required("copy", {"requires_copy_job": True}) is True
+
+    def test_mandatory_steps_always_required(self):
+        from chris_streaming.sse_service.tasks import _is_step_required
+        # plugin and delete can never be skipped regardless of params.
+        assert _is_step_required("plugin", {"requires_copy_job": False}) is True
+        assert _is_step_required("delete", {"requires_upload_job": False}) is True
+
+    def test_first_active_step_all_required(self):
+        from chris_streaming.sse_service.tasks import _first_active_step
+        assert _first_active_step({
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }) == "copy"
+
+    def test_first_active_step_skips_copy(self):
+        from chris_streaming.sse_service.tasks import _first_active_step
+        assert _first_active_step({
+            "requires_copy_job": False,
+            "requires_upload_job": True,
+        }) == "plugin"
+
+    def test_next_active_step_skips_upload(self):
+        from chris_streaming.sse_service.tasks import _next_active_step
+        # After plugin with upload disabled, next is delete.
+        assert _next_active_step("plugin", {
+            "requires_copy_job": True,
+            "requires_upload_job": False,
+        }) == "delete"
+
+    def test_next_active_step_preserves_upload_when_required(self):
+        from chris_streaming.sse_service.tasks import _next_active_step
+        assert _next_active_step("plugin", {
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }) == "upload"
+
+    def test_next_active_step_delete_always_goes_to_cleanup(self):
+        from chris_streaming.sse_service.tasks import _next_active_step
+        assert _next_active_step("delete", {
+            "requires_copy_job": False,
+            "requires_upload_job": False,
+        }) == "cleanup"
+
+
+class TestTerminalWorkflowStatus:
+    """Tests for _compute_terminal_workflow_status."""
+
+    def _params(self, requires_copy=True, requires_upload=True):
+        return {
+            "requires_copy_job": requires_copy,
+            "requires_upload_job": requires_upload,
+        }
+
+    def test_happy_path_finished_successfully(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "finishedSuccessfully"
+
+    def test_plugin_error_but_clean_pipeline_is_finished_with_error(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedWithError",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "finishedWithError"
+
+    def test_copy_failure_is_failed(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedWithError",
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_upload_failure_is_failed(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedWithError",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_delete_failure_is_failed(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedWithError",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_plugin_undefined_is_failed(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "undefined",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_missing_plugin_row_is_failed(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_skipped_upload_does_not_count(self):
+        """When requires_upload_job=false, upload must not be required for success."""
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(requires_upload=False), per_step,
+        ) == "finishedSuccessfully"
+
+    def test_skipped_copy_does_not_count(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(requires_copy=False), per_step,
+        ) == "finishedSuccessfully"
+
+    def test_plugin_error_with_skipped_upload_is_finished_with_error(self):
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "finishedSuccessfully",
+            "plugin": "finishedWithError",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(requires_upload=False), per_step,
+        ) == "finishedWithError"
+
+
+class TestStartWorkflowSkipLogic:
+    """Tests that start_workflow honours pfcon's requires_*_job flags."""
+
+    def _mock_db(self, mock_db_ctx):
+        mock_conn = MagicMock()
+        mock_cur = MagicMock()
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        return mock_conn, mock_cur
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_skips_copy_when_not_required(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = self._mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.return_value = {
+            "requires_copy_job": False,
+            "requires_upload_job": True,
+        }
+
+        start_workflow("job-x", {"image": "img:1"})
+
+        # The initial step must be 'plugin', not 'copy'.
+        insert_call = mock_cur.execute.call_args_list[0]
+        insert_args = insert_call[0][1]
+        assert insert_args[1] == "plugin"
+        mock_execute.assert_called_once()
+        assert mock_execute.call_args[0][1] == "plugin"
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_uses_copy_when_required(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = self._mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.return_value = {
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }
+
+        start_workflow("job-x", {"image": "img:1"})
+
+        insert_call = mock_cur.execute.call_args_list[0]
+        insert_args = insert_call[0][1]
+        assert insert_args[1] == "copy"
+        assert mock_execute.call_args[0][1] == "copy"
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_persists_flags_in_params(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = self._mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.return_value = {
+            "requires_copy_job": True,
+            "requires_upload_job": False,
+        }
+
+        start_workflow("job-x", {"image": "img:1"})
+
+        insert_args = mock_cur.execute.call_args_list[0][0][1]
+        params_json = insert_args[2]
+        params = json.loads(params_json)
+        assert params["requires_copy_job"] is True
+        assert params["requires_upload_job"] is False
+        assert params["image"] == "img:1"
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_pfcon_unreachable_fails_safe(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        """When pfcon's config fetch fails, default to requiring both optional steps."""
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = self._mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.side_effect = RuntimeError("pfcon down")
+
+        start_workflow("job-x", {"image": "img:1"})
+
+        insert_args = mock_cur.execute.call_args_list[0][0][1]
+        assert insert_args[1] == "copy"
+        params = json.loads(insert_args[2])
+        assert params["requires_copy_job"] is True
+        assert params["requires_upload_job"] is True

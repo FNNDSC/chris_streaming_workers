@@ -3,8 +3,13 @@
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from chris_streaming.common.schemas import JobType, LogEvent
-from chris_streaming.log_consumer.opensearch_writer import OpenSearchWriter
+from chris_streaming.log_consumer.opensearch_writer import (
+    OpenSearchBulkError,
+    OpenSearchWriter,
+)
 
 
 class TestOpenSearchWriter:
@@ -77,3 +82,57 @@ class TestOpenSearchWriter:
         writer._client = mock_client
         await writer.close()
         mock_client.close.assert_awaited_once()
+
+    async def test_write_batch_raises_on_partial_failure(self, sample_log_event):
+        """A partial _bulk failure must raise so the consumer skips commit."""
+        writer = OpenSearchWriter("http://localhost:9200", "job-logs")
+        mock_client = AsyncMock()
+        mock_client.bulk = AsyncMock(return_value={
+            "errors": True,
+            "items": [
+                {"index": {"status": 201}},
+                {"index": {
+                    "status": 400,
+                    "error": {"type": "mapper_parsing_exception", "reason": "bad type"},
+                }},
+                {"index": {
+                    "status": 503,
+                    "error": {"type": "cluster_block_exception", "reason": "read-only"},
+                }},
+            ],
+        })
+        writer._client = mock_client
+
+        events = [
+            LogEvent(
+                job_id=f"job-{i}",
+                job_type=JobType.plugin,
+                line=f"line {i}",
+                timestamp=datetime(2026, 1, 15, 12, 0, i, tzinfo=timezone.utc),
+            )
+            for i in range(3)
+        ]
+        with pytest.raises(OpenSearchBulkError) as excinfo:
+            await writer.write_batch(events)
+        assert excinfo.value.failed == 2
+        assert excinfo.value.total == 3
+        assert "bad type" in excinfo.value.sample_reasons
+        assert "read-only" in excinfo.value.sample_reasons
+
+    async def test_write_batch_raises_even_with_single_item_failure(self):
+        writer = OpenSearchWriter("http://localhost:9200", "job-logs")
+        mock_client = AsyncMock()
+        mock_client.bulk = AsyncMock(return_value={
+            "errors": True,
+            "items": [{"index": {"error": "boom"}}],
+        })
+        writer._client = mock_client
+
+        event = LogEvent(
+            job_id="j",
+            job_type=JobType.plugin,
+            line="line",
+            timestamp=datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        with pytest.raises(OpenSearchBulkError):
+            await writer.write_batch([event])

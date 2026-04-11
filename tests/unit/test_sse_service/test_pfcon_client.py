@@ -126,3 +126,47 @@ class TestPfconClient:
         client = self._make_client()
         result = client.remove_container("j1", "unknown")
         assert result is False
+
+    def test_get_server_info_returns_payload(self):
+        client = self._make_client()
+        client._token = "t"
+        payload = {
+            "server_version": "4.2.0",
+            "pfcon_innetwork": True,
+            "storage_env": "fslink",
+            "requires_copy_job": True,
+            "requires_upload_job": False,
+            "container_env": "docker",
+            "compute_volume_type": "host",
+        }
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = payload
+        client._session = MagicMock()
+        client._session.request.return_value = mock_resp
+
+        info = client.get_server_info()
+        assert info["requires_copy_job"] is True
+        assert info["requires_upload_job"] is False
+
+    def test_get_server_info_caches_result(self):
+        """Subsequent calls must not re-hit pfcon."""
+        client = self._make_client()
+        client._token = "t"
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }
+        client._session = MagicMock()
+        client._session.request.return_value = mock_resp
+
+        info1 = client.get_server_info()
+        info2 = client.get_server_info()
+
+        assert info1 == info2
+        # Only one GET should have been issued, regardless of invocation count.
+        get_calls = [c for c in client._session.request.call_args_list
+                     if c[0][0] == "GET"]
+        assert len(get_calls) == 1

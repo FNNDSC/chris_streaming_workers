@@ -3,12 +3,23 @@ End-of-Stream (EOS) marker producer.
 
 After a container dies, waits for Fluent Bit to flush remaining logs,
 then produces an EOS LogEvent to the job-logs Kafka topic. The Log
-Consumer uses this marker to signal that all logs for the container
-have been written to OpenSearch.
+Consumer uses this marker as a *hint* that all logs for the container
+have likely been written to OpenSearch, and sets a Redis key that
+cleanup_containers can fast-path on.
 
-The delay (configurable via EOS_DELAY_SECONDS) must be >= Fluent Bit's
-Refresh_Interval + Flush interval to ensure all log lines have been
-produced to Kafka before the EOS marker arrives.
+IMPORTANT — EOS is a best-effort flush hint, not a correctness guarantee.
+Kafka's ordering guarantee applies per producer within a partition, not
+across producers. Fluent Bit and the Event Forwarder are independent
+producers writing to the same partition (same job_id key), so the EOS
+marker can in principle arrive before some of Fluent Bit's in-flight log
+lines under broker backpressure, client retries, or if Fluent Bit is
+still buffering when the delay expires.
+
+The ``EOS_DELAY_SECONDS`` default (10s) should comfortably exceed Fluent
+Bit's Refresh_Interval + Flush interval under normal load. When the hint
+fails or is never delivered, ``cleanup_containers`` falls back to a
+terminal-status quiescence check (see ``SSEServiceSettings.eos_quiescence_seconds``)
+so cleanup does not block on EOS alone.
 """
 
 from __future__ import annotations

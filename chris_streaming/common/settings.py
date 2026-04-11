@@ -84,3 +84,7 @@ class SSEServiceSettings(RedisSettings):
     pfcon_url: str = "http://pfcon:30005"
     pfcon_user: str = "pfcon"
     pfcon_password: str = "pfcon1234"
+    # Quiescence window used by cleanup_containers as the EOS backstop:
+    # if a terminal per-step status has been stable for this many seconds
+    # without a logs_flushed signal, treat the logs as drained and proceed.
+    eos_quiescence_seconds: float = 10.0

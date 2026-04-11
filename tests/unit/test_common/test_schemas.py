@@ -147,6 +147,71 @@ class TestLogEvent:
         assert event.stream == "stdout"
         assert event.eos is False
 
+    def test_auto_event_id(self):
+        event = LogEvent(
+            job_id="j1",
+            job_type=JobType.plugin,
+            line="hello",
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        assert len(event.event_id) == 24
+        assert event.event_id != ""
+
+    def test_event_id_deterministic(self):
+        """Two LogEvents with identical fields must have identical event_id."""
+        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        e1 = LogEvent(
+            job_id="j1", job_type=JobType.plugin,
+            container_name="c1", line="hello", stream="stdout", timestamp=ts,
+        )
+        e2 = LogEvent(
+            job_id="j1", job_type=JobType.plugin,
+            container_name="c1", line="hello", stream="stdout", timestamp=ts,
+        )
+        assert e1.event_id == e2.event_id
+
+    def test_event_id_differs_for_different_lines(self):
+        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        e1 = LogEvent(
+            job_id="j1", job_type=JobType.plugin, line="hello", timestamp=ts,
+        )
+        e2 = LogEvent(
+            job_id="j1", job_type=JobType.plugin, line="world", timestamp=ts,
+        )
+        assert e1.event_id != e2.event_id
+
+    def test_event_id_differs_for_different_streams(self):
+        ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        e1 = LogEvent(
+            job_id="j1", job_type=JobType.plugin, line="x",
+            stream="stdout", timestamp=ts,
+        )
+        e2 = LogEvent(
+            job_id="j1", job_type=JobType.plugin, line="x",
+            stream="stderr", timestamp=ts,
+        )
+        assert e1.event_id != e2.event_id
+
+    def test_custom_event_id_preserved(self):
+        event = LogEvent(
+            event_id="custom456",
+            job_id="j1",
+            job_type=JobType.plugin,
+            line="hello",
+        )
+        assert event.event_id == "custom456"
+
+    def test_event_id_round_trip(self):
+        """Deserializing a LogEvent must preserve the event_id."""
+        original = LogEvent(
+            job_id="j1",
+            job_type=JobType.plugin,
+            line="hello",
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        restored = LogEvent.deserialize_from_kafka(original.serialize_for_kafka())
+        assert restored.event_id == original.event_id
+
 
 # ── kafka_key_for_job ─────────────────────────────────────────────────────
 

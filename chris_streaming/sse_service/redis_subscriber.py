@@ -76,6 +76,9 @@ async def subscribe_to_job(
             async for data in _replay_log_history(
                 opensearch_url, opensearch_index_prefix, job_id
             ):
+                event_id = data.get("event_id", "")
+                if event_id:
+                    seen_event_ids.add(event_id)
                 yield data
 
         # Phase 3: Drain buffered live messages

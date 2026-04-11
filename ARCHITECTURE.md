@@ -139,8 +139,8 @@ class SSE,UI ui
    - Matching logs are reshaped to the `LogEvent` schema and forwarded to Kafka topic `job-logs`, keyed by `job_id`.
 2. **Event Forwarder** produces delayed EOS (End-of-Stream) markers to `job-logs`:
    - When a terminal status event is detected (container die/finish), schedules a delayed EOS marker (default 10s).
-   - The delay ensures Fluent Bit has time to flush all remaining log lines before the EOS arrives.
-   - EOS markers use the same `job_id` as the partition key, so they are guaranteed to arrive after all log lines for that container on the same partition.
+   - The delay gives Fluent Bit time to flush remaining log lines before the EOS arrives, but this is a best-effort hint, not a correctness guarantee (Kafka ordering is per-producer, not across producers — see the EOS section below).
+   - EOS markers use the same `job_id` as the partition key and reach the same partition as Fluent Bit's log lines, but interleaving across the two independent producers is possible in principle.
 3. **Log Consumer** reads from `job-logs` in configurable batches (default: 200 messages or 2 seconds):
    - Bulk-writes to **OpenSearch** using the `_bulk` API with daily index rotation (`job-logs-YYYY.MM.DD`).
    - Publishes each event to **Redis Pub/Sub** channel `job:{job_id}:logs`.
@@ -168,33 +168,55 @@ The Celery Worker implements an event-driven workflow state machine that orchest
 copy → plugin → upload → delete → cleanup → completed
 ```
 
+The `copy` and `upload` steps are **optional** — at workflow start the Celery Worker GETs pfcon's server configuration from `/api/v1/pluginjobs/` and reads `requires_copy_job` and `requires_upload_job`. Any optional step whose flag is `false` is skipped entirely (no pfcon call, no container, no wait for a status event). For fslink mode this typically skips `upload`; for other storage backends both may run.
+
 1. **UI** submits a `POST /api/jobs/{job_id}/run` request to the SSE Service.
 2. **SSE Service** schedules a `start_workflow` Celery task.
 3. **Celery Worker** (`start_workflow`):
-   - Inserts a `job_workflow` row in PostgreSQL with `current_step='copy'` and the workflow params.
-   - Calls pfcon to schedule the copy job.
+   - Calls `PfconClient.get_server_info()` (cached per process) to read the `requires_*_job` flags.
+   - Folds the flags into the workflow `params`, which are persisted in JSONB so subsequent step advancement can honour them without re-hitting pfcon.
+   - Inserts a `job_workflow` row with `current_step` set to the **first active step** (e.g., `plugin` if copy is not required) and `status='running'`.
+   - Calls pfcon to schedule the first active step.
 4. **Celery Worker** (`process_job_status`) — on each terminal status event:
    - Checks if an active workflow exists for this `job_id`.
-   - If the terminal event matches the current step's `job_type`, advances to the next step.
+   - If the terminal event matches the current step's `job_type`, computes the next active step via `_next_active_step()` (which skips optional steps based on the persisted flags).
    - Step advancement is atomic: `UPDATE job_workflow SET current_step = next WHERE current_step = current` (idempotent via rowcount check).
    - Calls pfcon to schedule the next job.
    - If pfcon returns an immediate completion (e.g., `uploadSkipped` in fslink mode), advances again without waiting for a Docker event.
-5. **Failure handling**: If any step fails (copy, plugin, or upload), the workflow skips directly to `delete` for cleanup and marks the workflow status as `failed`.
+5. **Failure handling**: If any step fails (copy, plugin, upload), or if the pfcon call itself raises, the workflow skips directly to `delete` for cleanup. The terminal workflow status is not decided mid-flight; `status` stays `running` until cleanup completes.
 6. **Cleanup** (`cleanup_containers`):
-   - Waits for `logs_flushed` Redis keys for all job types that actually created containers (queries `job_status` table).
+   - Waits for `logs_flushed` Redis keys for all job types that have a `job_status` row. Missing keys are tolerated if the step's terminal status has been stable in `job_status` for at least `eos_quiescence_seconds` (the EOS backstop — see the EOS section).
    - Retries every 2 seconds, up to 60 seconds (safety valve).
-   - Calls pfcon `DELETE` for each container type, then marks workflow as `completed`.
+   - Calls pfcon `DELETE` for each container type.
+   - **Computes the terminal workflow status** from the per-step outcomes recorded in `job_status`:
+     - All required non-plugin steps (copy if required, upload if required, delete) must be `finishedSuccessfully`.
+     - If plugin is `finishedSuccessfully` → workflow `status = finishedSuccessfully`.
+     - If plugin is `finishedWithError` → workflow `status = finishedWithError` (a clean non-zero exit of the plugin container is a legitimate run outcome, not a workflow failure).
+     - Otherwise (any required step missing or non-success, or plugin in another state like `undefined`) → workflow `status = failed`.
+   - Updates `job_workflow.status` with the terminal value and publishes the final `job:{id}:workflow` Redis event.
+
+#### Workflow Redis event shape
+
+Every `job:{id}:workflow` publish carries:
+
+| Field | Description |
+|-------|-------------|
+| `job_id` | pfcon job identifier |
+| `current_step` | the step the workflow is now sitting in (`copy`, `plugin`, `upload`, `delete`, `cleanup`, or `completed`) |
+| `current_step_status` | the status of that current step (e.g. `started`, `finishedSuccessfully`, `finishedWithError`) |
+| `workflow_status` | overall workflow status: `running` while in motion, or one of `finishedSuccessfully`, `finishedWithError`, `failed` once cleanup has completed |
+| `error` | (optional) error string present when a step fails synchronously during scheduling |
 
 ### EOS (End-of-Stream) mechanism
 
-The EOS mechanism ensures logs are durably stored before containers are deleted:
+The EOS mechanism is the **fast path** for knowing when a container's logs have been durably stored. It is a hint, not the correctness signal.
 
 1. When the **Event Forwarder** detects a terminal container event (die), it schedules a delayed EOS marker (default 10s) to the `job-logs` Kafka topic.
-2. The delay ensures Fluent Bit has flushed all remaining log lines from the container's JSON log file.
-3. The EOS marker uses the same `job_id` partition key, so Kafka ordering guarantees it arrives after all log lines on the same partition.
+2. The delay gives Fluent Bit time to flush remaining log lines from the container's JSON log file before the EOS arrives. Under normal load this is comfortably long; under broker backpressure, client retries, or a lagging Fluent Bit it may not be.
+3. The EOS marker uses the same `job_id` partition key and therefore reaches the same partition as Fluent Bit's log lines. Kafka ordering is **per-producer** within a partition, so ordering across the two independent producers (Fluent Bit and the Event Forwarder) is not guaranteed by the broker.
 4. When the **Log Consumer** receives an EOS marker, it flushes the current batch to OpenSearch and sets a Redis key `job:{job_id}:{job_type}:logs_flushed`.
-5. The **Celery Worker**'s `cleanup_containers` task polls for these Redis keys before calling pfcon to delete containers.
-6. For steps that complete immediately without creating containers (e.g., upload in fslink mode), the `logs_flushed` key is set immediately by the Celery Worker.
+5. The **Celery Worker**'s `cleanup_containers` task uses the Redis key as a fast path. If the key is missing, it falls back to a **terminal-status quiescence** check: once a step's terminal status has been recorded in `job_status` for at least `eos_quiescence_seconds` (default 10s), the logs are treated as drained and cleanup proceeds. This ensures cleanup never blocks forever on a missing EOS.
+6. For steps that complete immediately without creating containers (e.g., upload when `requires_upload_job=false`, or on pfcon scheduling failure), the `logs_flushed` key is set immediately by the Celery Worker.
 
 ## Message schemas
 
@@ -220,6 +242,7 @@ Mirrors pfcon's `JobInfo` dataclass from `pfcon/compute/abstractmgr.py`.
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `event_id` | `str` | Deterministic SHA-256 hash derived from `(job_id, job_type, container_name, stream, timestamp, line)` — used to dedupe replayed history against live Redis Pub/Sub messages |
 | `job_id` | `str` | pfcon job identifier |
 | `job_type` | `enum` | `plugin`, `copy`, `upload`, or `delete` |
 | `container_name` | `str` | Docker container name |

@@ -17,6 +17,20 @@ from chris_streaming.common.schemas import LogEvent
 logger = logging.getLogger(__name__)
 
 
+class OpenSearchBulkError(Exception):
+    """Raised when an OpenSearch bulk write reports any per-item failures."""
+
+    def __init__(self, failed: int, total: int, sample_reasons: list[str]):
+        self.failed = failed
+        self.total = total
+        self.sample_reasons = sample_reasons
+        msg = (
+            f"OpenSearch bulk write failed: {failed}/{total} items rejected; "
+            f"sample reasons: {sample_reasons}"
+        )
+        super().__init__(msg)
+
+
 class OpenSearchWriter:
     """Async OpenSearch bulk writer for log events."""
 
@@ -42,6 +56,7 @@ class OpenSearchWriter:
                 },
                 "mappings": {
                     "properties": {
+                        "event_id": {"type": "keyword"},
                         "job_id": {"type": "keyword"},
                         "job_type": {"type": "keyword"},
                         "container_name": {"type": "keyword"},
@@ -71,10 +86,23 @@ class OpenSearchWriter:
 
         resp = await self._client.bulk(body=body)
         if resp.get("errors"):
-            failed = sum(1 for item in resp["items"] if "error" in item.get("index", {}))
-            logger.error("OpenSearch bulk write: %d/%d failed", failed, len(events))
-        else:
-            logger.debug("OpenSearch bulk write: %d documents indexed", len(events))
+            items = resp.get("items", [])
+            failed = sum(1 for item in items if "error" in item.get("index", {}))
+            sample_reasons: list[str] = []
+            for item in items:
+                err = item.get("index", {}).get("error")
+                if err:
+                    reason = err.get("reason") if isinstance(err, dict) else str(err)
+                    if reason and reason not in sample_reasons:
+                        sample_reasons.append(reason)
+                    if len(sample_reasons) >= 3:
+                        break
+            logger.error(
+                "OpenSearch bulk write: %d/%d failed; reasons=%s",
+                failed, len(events), sample_reasons,
+            )
+            raise OpenSearchBulkError(failed, len(events), sample_reasons)
+        logger.debug("OpenSearch bulk write: %d documents indexed", len(events))
 
     def _index_name(self, timestamp: datetime) -> str:
         if hasattr(timestamp, "strftime"):

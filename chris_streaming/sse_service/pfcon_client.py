@@ -32,9 +32,35 @@ class PfconClient:
         self._username = username
         self._password = password
         self._token: str | None = None
+        self._server_info: dict | None = None
         self._lock = threading.Lock()
         self._session = requests.Session()
         self._session.headers["Accept"] = "application/json"
+
+    def get_server_info(self) -> dict:
+        """GET pfcon server configuration (cached for process lifetime).
+
+        The payload includes ``requires_copy_job`` and ``requires_upload_job``
+        booleans that determine whether the client must schedule those steps
+        or can skip them.
+        """
+        with self._lock:
+            if self._server_info is not None:
+                return self._server_info
+        resp = self._request_with_reauth(
+            "GET",
+            f"{self._base_url}/api/v1/pluginjobs/",
+        )
+        resp.raise_for_status()
+        info = resp.json()
+        with self._lock:
+            self._server_info = info
+        logger.info(
+            "pfcon server info: requires_copy_job=%s requires_upload_job=%s",
+            info.get("requires_copy_job"),
+            info.get("requires_upload_job"),
+        )
+        return info
 
     def _ensure_token(self) -> str:
         """Authenticate with pfcon and cache the JWT token."""

@@ -111,7 +111,7 @@ _STEP_JOB_TYPE = {
     "delete": "delete",
 }
 
-# Workflow step progression
+# Workflow step progression (linear; skip logic is applied on top of this).
 _NEXT_STEP = {
     "copy": "plugin",
     "plugin": "upload",
@@ -119,15 +119,46 @@ _NEXT_STEP = {
     "delete": "cleanup",
 }
 
-# Steps to skip to on failure (go straight to delete for cleanup)
+# On failure, jump straight to delete for cleanup (or cleanup if already at delete).
 _FAILURE_STEP = {
     "copy": "delete",
     "plugin": "delete",
     "upload": "delete",
 }
 
+# Steps that may be skipped based on pfcon server config.
+_OPTIONAL_STEPS = {"copy", "upload"}
+
 # Terminal statuses that indicate completion
 _TERMINAL_STATUSES = {"finishedSuccessfully", "finishedWithError", "undefined"}
+
+# Terminal workflow status values (written to job_workflow.status at cleanup time).
+_WORKFLOW_TERMINAL = {"finishedSuccessfully", "finishedWithError", "failed"}
+
+
+def _is_step_required(step: str, params: dict) -> bool:
+    """Return True if the given workflow step must be scheduled."""
+    if step not in _OPTIONAL_STEPS:
+        return True
+    flag = params.get(f"requires_{step}_job")
+    # Default to True if the flag is missing — fail-safe (don't silently skip).
+    return bool(flag) if flag is not None else True
+
+
+def _first_active_step(params: dict) -> str:
+    """Return the first step that should actually run for this workflow."""
+    step = "copy"
+    while step in _OPTIONAL_STEPS and not _is_step_required(step, params):
+        step = _NEXT_STEP[step]
+    return step
+
+
+def _next_active_step(current_step: str, params: dict) -> str | None:
+    """Return the next step to execute, skipping optional steps the server doesn't need."""
+    step = _NEXT_STEP.get(current_step)
+    while step in _OPTIONAL_STEPS and not _is_step_required(step, params):
+        step = _NEXT_STEP.get(step)
+    return step
 
 # ── Connection pools (initialized at worker startup) ────────────────────────
 
@@ -296,59 +327,71 @@ def process_job_status(self, event_data: dict) -> dict:
     }
 
 
+def _publish_workflow_event(
+    job_id: str,
+    current_step: str,
+    current_step_status: str,
+    workflow_status: str,
+    extra: dict | None = None,
+) -> None:
+    """Publish a structured workflow event to Redis Pub/Sub.
+
+    Every workflow event carries three fields:
+      - ``current_step``: the step the workflow is now sitting in
+      - ``current_step_status``: the status of that current step
+      - ``workflow_status``: the overall workflow status (``running`` while
+        in motion, or a terminal value at cleanup completion)
+    """
+    payload = {
+        "job_id": job_id,
+        "current_step": current_step,
+        "current_step_status": current_step_status,
+        "workflow_status": workflow_status,
+    }
+    if extra:
+        payload.update(extra)
+    _get_redis().publish(f"job:{job_id}:workflow", json.dumps(payload))
+
+
 def _try_advance_workflow(job_id: str, job_type: str, status: str) -> None:
-    """Check if there's an active workflow and advance to the next step."""
+    """Check if there's an active workflow and advance to the next step.
+
+    The workflow stays in ``running`` state until cleanup completes, at which
+    point ``cleanup_containers`` computes the terminal workflow status from
+    the per-step records in ``job_status``. This function never writes a
+    terminal status to ``job_workflow``.
+    """
     with _get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT current_step, status, params FROM job_workflow "
-                "WHERE job_id = %s AND status IN ('running', 'failed') FOR UPDATE",
+                "SELECT current_step, params FROM job_workflow "
+                "WHERE job_id = %s AND status = 'running' FOR UPDATE",
                 (job_id,),
             )
             row = cur.fetchone()
             if row is None:
                 return  # No active workflow for this job
 
-            current_step, current_wf_status, params = row
+            current_step, params = row
             expected_job_type = _STEP_JOB_TYPE.get(current_step)
 
-            # Only advance if this event matches the current step's job_type
+            # Only advance if this event matches the current step's job_type.
             if job_type != expected_job_type:
                 return
 
             succeeded = (status == "finishedSuccessfully")
 
             if succeeded:
-                next_step = _NEXT_STEP.get(current_step)
+                next_step = _next_active_step(current_step, params)
             else:
-                # On failure: skip to delete for cleanup (or cleanup if already at delete)
+                # On failure: skip to delete for cleanup (or cleanup if already at delete).
                 next_step = _FAILURE_STEP.get(current_step, "cleanup")
 
-            # Preserve 'failed' status once set; only set 'failed' on new failures
-            if current_wf_status == "failed":
-                workflow_status = "failed"
-            elif not succeeded and current_step != "delete":
-                workflow_status = "failed"
-            else:
-                workflow_status = "running"
-
-            if next_step == "cleanup":
-                # Delete step is done — schedule container cleanup
-                cur.execute(
-                    "UPDATE job_workflow SET current_step = 'cleanup', "
-                    "status = CASE WHEN status = 'failed' THEN 'failed' ELSE %s END, "
-                    "updated_at = NOW() "
-                    "WHERE job_id = %s AND current_step = %s",
-                    (workflow_status, job_id, current_step),
-                )
-            else:
-                cur.execute(
-                    "UPDATE job_workflow SET current_step = %s, "
-                    "status = %s, updated_at = NOW() "
-                    "WHERE job_id = %s AND current_step = %s",
-                    (next_step, workflow_status, job_id, current_step),
-                )
-
+            cur.execute(
+                "UPDATE job_workflow SET current_step = %s, updated_at = NOW() "
+                "WHERE job_id = %s AND current_step = %s",
+                (next_step, job_id, current_step),
+            )
             advanced = cur.rowcount > 0
         conn.commit()
 
@@ -361,19 +404,19 @@ def _try_advance_workflow(job_id: str, job_type: str, status: str) -> None:
         job_id, current_step, next_step, succeeded,
     )
 
-    # Publish workflow status update to Redis
-    r = _get_redis()
-    r.publish(f"job:{job_id}:workflow", json.dumps({
-        "job_id": job_id,
-        "current_step": next_step,
-        "status": workflow_status,
-    }))
-
-    # Execute the next step
     if next_step == "cleanup":
+        # The delete step is done — schedule container cleanup. Publish
+        # 'started' for the cleanup step; the terminal event is published
+        # by cleanup_containers itself.
+        _publish_workflow_event(job_id, "cleanup", "started", "running")
         cleanup_containers.delay(job_id)
-    else:
-        _execute_workflow_step(job_id, next_step, params)
+        return
+
+    # Publish the 'started' state of the new step, then execute it. If the
+    # pfcon call returns an immediate terminal status, _execute_workflow_step
+    # will recurse into _try_advance_workflow and publish the next event.
+    _publish_workflow_event(job_id, next_step, "started", "running")
+    _execute_workflow_step(job_id, next_step, params)
 
 
 def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
@@ -381,7 +424,11 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
 
     If pfcon returns an immediate terminal status (e.g., uploadSkipped,
     deleteSkipped, copySkipped), advances the workflow without waiting
-    for a Docker event — because no container was created.
+    for a Docker event — because no container was created. If the pfcon
+    call itself raises, the workflow is advanced as if the step had
+    reported ``finishedWithError``, which will route via the failure path
+    to ``delete`` → cleanup; the terminal workflow status is computed at
+    cleanup time from ``job_status``.
     """
     resp = None
     try:
@@ -400,22 +447,17 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
                 logger.info("Scheduled delete: job=%s resp=%s", job_id, resp)
     except Exception as e:
         logger.error("Failed to execute workflow step %s for job=%s: %s", step, job_id, e)
-        # Mark workflow as failed
-        with _get_db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE job_workflow SET status = 'failed', updated_at = NOW() "
-                    "WHERE job_id = %s",
-                    (job_id,),
-                )
-            conn.commit()
-        r = _get_redis()
-        r.publish(f"job:{job_id}:workflow", json.dumps({
-            "job_id": job_id,
-            "current_step": step,
-            "status": "failed",
-            "error": str(e),
-        }))
+        # No container will be created, so set logs_flushed for this step.
+        jt = _STEP_JOB_TYPE[step]
+        _get_redis().set(f"job:{job_id}:{jt}:logs_flushed", "1", ex=3600)
+        # Publish a failed step event so SSE clients see the error immediately.
+        # The overall workflow_status stays 'running' until cleanup computes it.
+        _publish_workflow_event(
+            job_id, step, "finishedWithError", "running",
+            extra={"error": str(e)},
+        )
+        # Advance as if the step had reported finishedWithError.
+        _try_advance_workflow(job_id, jt, "finishedWithError")
         return
 
     # Check if pfcon returned an immediate terminal status (no container created).
@@ -428,16 +470,11 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
         )
         # No container was created, so no EOS marker will arrive.
         # Set logs_flushed immediately so cleanup_containers won't wait.
-        r = _get_redis()
         jt = _STEP_JOB_TYPE[step]
-        r.set(f"job:{job_id}:{jt}:logs_flushed", "1", ex=3600)
+        _get_redis().set(f"job:{job_id}:{jt}:logs_flushed", "1", ex=3600)
         logger.info("Set logs_flushed for skipped step: job=%s type=%s", job_id, jt)
 
-        _try_advance_workflow(
-            job_id,
-            jt,
-            pfcon_status,
-        )
+        _try_advance_workflow(job_id, jt, pfcon_status)
 
 
 # ── start_workflow ──────────────────────────────────────────────────────────
@@ -452,38 +489,86 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
 )
 def start_workflow(self, job_id: str, params: dict) -> dict:
     """
-    Initialize a workflow: store params in PostgreSQL and schedule
-    the copy job on pfcon.
+    Initialize a workflow: fetch pfcon server config, record which optional
+    steps must run, store params in PostgreSQL, and schedule the first
+    active step on pfcon.
     """
-    # Insert workflow record
+    # Fetch server config and fold the `requires_*_job` flags into params
+    # so step advancement can honour them without re-hitting pfcon.
+    try:
+        server_info = _pfcon.get_server_info()
+    except Exception as e:
+        logger.error("Failed to fetch pfcon server info for job=%s: %s", job_id, e)
+        # Fail-safe default: assume both optional steps are required.
+        server_info = {"requires_copy_job": True, "requires_upload_job": True}
+
+    params = dict(params)  # don't mutate the caller's dict
+    params["requires_copy_job"] = bool(server_info.get("requires_copy_job", True))
+    params["requires_upload_job"] = bool(server_info.get("requires_upload_job", True))
+
+    initial_step = _first_active_step(params)
+
     with _get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO job_workflow (job_id, current_step, status, params) "
-                "VALUES (%s, 'copy', 'running', %s) "
+                "VALUES (%s, %s, 'running', %s) "
                 "ON CONFLICT (job_id) DO UPDATE SET "
-                "current_step = 'copy', status = 'running', "
+                "current_step = EXCLUDED.current_step, status = 'running', "
                 "params = EXCLUDED.params, updated_at = NOW()",
-                (job_id, json.dumps(params)),
+                (job_id, initial_step, json.dumps(params)),
             )
         conn.commit()
-    logger.info("Workflow started: job=%s", job_id)
+    logger.info(
+        "Workflow started: job=%s initial_step=%s requires_copy=%s requires_upload=%s",
+        job_id, initial_step,
+        params["requires_copy_job"], params["requires_upload_job"],
+    )
 
-    # Publish workflow status
-    r = _get_redis()
-    r.publish(f"job:{job_id}:workflow", json.dumps({
-        "job_id": job_id,
-        "current_step": "copy",
-        "status": "running",
-    }))
+    _publish_workflow_event(job_id, initial_step, "started", "running")
 
-    # Schedule copy job on pfcon
-    _execute_workflow_step(job_id, "copy", params)
+    _execute_workflow_step(job_id, initial_step, params)
 
     return {"job_id": job_id, "status": "started"}
 
 
 # ── cleanup_containers ──────────────────────────────────────────────────────
+
+
+def _compute_terminal_workflow_status(
+    job_id: str, params: dict, per_step_status: dict[str, str]
+) -> str:
+    """Compute the terminal workflow_status from the recorded per-step outcomes.
+
+    Rules:
+      - Plugin must have run: its status drives finishedSuccessfully vs
+        finishedWithError when every required non-plugin step succeeded.
+      - Any required step missing or not finishedSuccessfully → ``failed``
+        (except plugin, which may be finishedWithError and still be a
+        non-failed outcome).
+    """
+    required_steps = ["plugin", "delete"]
+    if _is_step_required("copy", params):
+        required_steps.insert(0, "copy")
+    if _is_step_required("upload", params):
+        required_steps.insert(-1, "upload")
+
+    plugin_status = per_step_status.get("plugin")
+
+    for step in required_steps:
+        status = per_step_status.get(step)
+        if step == "plugin":
+            if status not in ("finishedSuccessfully", "finishedWithError"):
+                return "failed"
+            continue
+        if status != "finishedSuccessfully":
+            return "failed"
+
+    # All required non-plugin steps succeeded; plugin dictates success vs error.
+    if plugin_status == "finishedSuccessfully":
+        return "finishedSuccessfully"
+    return "finishedWithError"
+
 
 @celery_app.task(
     bind=True,
@@ -494,49 +579,71 @@ def start_workflow(self, job_id: str, params: dict) -> dict:
 )
 def cleanup_containers(self, job_id: str) -> dict:
     """
-    Wait for all logs to be flushed, then remove containers from pfcon.
+    Wait for all logs to be flushed (or for terminal-status quiescence),
+    then remove containers from pfcon and publish the terminal workflow
+    status.
 
-    Checks Redis for logs_flushed keys for each job type. Retries every
-    2 seconds (up to 60s) until all are present, then proceeds with
-    container removal.
+    The log-flush wait is the fast path: for every job type that has a
+    ``job_status`` row we check for a ``logs_flushed`` Redis key. If any
+    are missing, we also accept a bounded quiescence condition: the step's
+    terminal status has been recorded in ``job_status`` for at least
+    ``EOS_QUIESCENCE_SECONDS``. EOS is therefore a hint, not the sole
+    correctness signal — Kafka does not guarantee EOS ordering across
+    independent producers (Fluent Bit and the Event Forwarder), so we
+    must not block cleanup on it alone.
     """
     r = _get_redis()
 
-    # Only wait for job types that actually created containers.
-    # Query job_status to find which job types have status records.
+    # Fetch per-step terminal statuses and their ages. We only care about
+    # steps that actually created containers (have a job_status row).
     with _get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT job_type FROM job_status WHERE job_id = %s",
+                "SELECT job_type, status, "
+                "       EXTRACT(EPOCH FROM (NOW() - updated_at)) "
+                "FROM job_status WHERE job_id = %s",
                 (job_id,),
             )
-            job_types = [row[0] for row in cur.fetchall()]
+            rows = cur.fetchall()
+            cur.execute(
+                "SELECT params FROM job_workflow WHERE job_id = %s",
+                (job_id,),
+            )
+            wf_row = cur.fetchone()
 
-    if not job_types:
-        job_types = ["copy", "plugin", "upload", "delete"]
-        logger.warning("No job_status records for job=%s, checking all types", job_id)
+    per_step_status = {row[0]: row[1] for row in rows}
+    per_step_age = {row[0]: float(row[2] or 0.0) for row in rows}
+    params = wf_row[0] if wf_row else {}
 
-    # Check which logs are flushed
-    missing = []
-    for jt in job_types:
-        key = f"job:{job_id}:{jt}:logs_flushed"
-        if not r.exists(key):
-            missing.append(jt)
+    quiescence_seconds = float(getattr(settings, "eos_quiescence_seconds", 10.0))
 
-    if missing and self.request.retries < self.max_retries:
+    # Determine which job_types we're waiting on. Log-flush is preferred;
+    # quiescence is the backstop.
+    waiting_on = []
+    for jt, status in per_step_status.items():
+        if r.exists(f"job:{job_id}:{jt}:logs_flushed"):
+            continue
+        if status in _TERMINAL_STATUSES and per_step_age.get(jt, 0.0) >= quiescence_seconds:
+            # Terminal status has been stable for long enough — treat as flushed.
+            continue
+        waiting_on.append(jt)
+
+    if waiting_on and self.request.retries < self.max_retries:
         logger.info(
-            "Waiting for logs_flushed: job=%s missing=%s (retry %d/%d)",
-            job_id, missing, self.request.retries, self.max_retries,
+            "cleanup_containers waiting: job=%s waiting_on=%s "
+            "(retry %d/%d, quiescence=%.1fs)",
+            job_id, waiting_on, self.request.retries, self.max_retries,
+            quiescence_seconds,
         )
         raise self.retry()
 
-    if missing:
+    if waiting_on:
         logger.warning(
-            "Proceeding with cleanup despite missing logs_flushed: job=%s missing=%s",
-            job_id, missing,
+            "Proceeding with cleanup despite unflushed logs: job=%s waiting_on=%s",
+            job_id, waiting_on,
         )
 
-    # Remove containers for all known job types (including skipped ones, harmless if absent)
+    # Remove containers for all known job types (harmless if absent).
     all_job_types = ["copy", "plugin", "upload", "delete"]
     for jt in all_job_types:
         try:
@@ -544,28 +651,45 @@ def cleanup_containers(self, job_id: str) -> dict:
         except Exception as e:
             logger.warning("Failed to remove %s container for job=%s: %s", jt, job_id, e)
 
-    # Mark workflow as completed
+    # Re-read per-step status after the delete calls: the delete step itself
+    # may have just recorded its own terminal status through the event pipeline.
+    with _get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT job_type, status FROM job_status WHERE job_id = %s",
+                (job_id,),
+            )
+            per_step_status = {row[0]: row[1] for row in cur.fetchall()}
+
+    workflow_status = _compute_terminal_workflow_status(
+        job_id, params, per_step_status,
+    )
+
     with _get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE job_workflow SET current_step = 'completed', "
-                "updated_at = NOW(), "
-                "status = CASE WHEN status = 'failed' THEN 'failed' ELSE 'completed' END "
+                "status = %s, updated_at = NOW() "
                 "WHERE job_id = %s",
-                (job_id,),
+                (workflow_status, job_id),
             )
         conn.commit()
 
-    # Publish workflow completion
-    r.publish(f"job:{job_id}:workflow", json.dumps({
-        "job_id": job_id,
-        "current_step": "completed",
-        "status": "completed",
-    }))
+    logger.info(
+        "Workflow cleanup completed: job=%s workflow_status=%s per_step=%s",
+        job_id, workflow_status, per_step_status,
+    )
 
-    # Clean up logs_flushed keys
+    _publish_workflow_event(
+        job_id, "completed", "finishedSuccessfully", workflow_status,
+    )
+
+    # Clean up logs_flushed keys.
     for jt in all_job_types:
         r.delete(f"job:{job_id}:{jt}:logs_flushed")
 
-    logger.info("Workflow cleanup completed: job=%s", job_id)
-    return {"job_id": job_id, "status": "cleaned_up"}
+    return {
+        "job_id": job_id,
+        "status": "cleaned_up",
+        "workflow_status": workflow_status,
+    }
