@@ -36,34 +36,42 @@ jobs:
           docker run -d --restart=always \
             -p 127.0.0.1:5005:5000 \
             --name chris-k8s-registry registry:2
+      - name: Write kind config
+        run: |
+          cat > /tmp/kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 30080
+              hostPort: 30080
+            - containerPort: 30888
+              hostPort: 30888
+            - containerPort: 30005
+              hostPort: 30005
+          EOF
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: chris-streaming
-          # Trust the host-side local registry from inside the kind node.
-          config: |
-            kind: Cluster
-            apiVersion: kind.x-k8s.io/v1alpha4
-            containerdConfigPatches:
-              - |-
-                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5005"]
-                  endpoint = ["http://host.docker.internal:5005"]
-            nodes:
-              - role: control-plane
-                extraPortMappings:
-                  - containerPort: 30080
-                    hostPort: 30080
-                  - containerPort: 30888
-                    hostPort: 30888
-                  - containerPort: 30005
-                    hostPort: 30005
-      - name: Wire kind node DNS to host registry
+          config: /tmp/kind-config.yaml
+      - name: Connect registry to kind network
         run: |
-          # host.docker.internal isn't resolvable inside kind by default on Linux.
-          gateway_ip=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}')
+          docker network connect kind chris-k8s-registry
+          # Configure containerd on kind nodes to resolve localhost:5005
+          # to the registry container on the kind docker network.
           for node in $(kind get nodes --name chris-streaming); do
-            docker exec "$node" sh -c "echo '$gateway_ip host.docker.internal' >> /etc/hosts"
+            docker exec "$node" mkdir -p /etc/containerd/certs.d/localhost:5005
+            docker exec "$node" sh -c 'cat > /etc/containerd/certs.d/localhost:5005/hosts.toml <<TOML
+          [host."http://chris-k8s-registry:5000"]
+            capabilities = ["pull", "resolve"]
+          TOML'
+            docker exec "$node" systemctl restart containerd
           done
+          # Wait for containerd and kubelet to recover after restart.
+          sleep 5
+          kubectl wait --for=condition=Ready nodes --all --timeout=120s
       - name: Build and push images to local registry
         run: just k8s-build
       - name: Unit tests (k8s)
