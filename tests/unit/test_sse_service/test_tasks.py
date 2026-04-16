@@ -300,6 +300,26 @@ class TestTerminalWorkflowStatus:
             "j1", self._params(), per_step,
         ) == "failed"
 
+    def test_copy_undefined_is_failed(self):
+        """undefined on a required non-plugin step also fails the workflow."""
+        from chris_streaming.sse_service.tasks import (
+            _compute_terminal_workflow_status,
+        )
+        per_step = {
+            "copy": "undefined",
+            "plugin": "finishedSuccessfully",
+            "upload": "finishedSuccessfully",
+            "delete": "finishedSuccessfully",
+        }
+        assert _compute_terminal_workflow_status(
+            "j1", self._params(), per_step,
+        ) == "failed"
+
+    def test_undefined_is_terminal_status(self):
+        """Sanity check: orchestrator recognizes undefined as terminal."""
+        from chris_streaming.sse_service.tasks import _TERMINAL_STATUSES
+        assert "undefined" in _TERMINAL_STATUSES
+
     def test_missing_plugin_row_is_failed(self):
         from chris_streaming.sse_service.tasks import (
             _compute_terminal_workflow_status,

@@ -1,0 +1,22 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: unit-tests
+  namespace: chris-streaming-test
+  labels:
+    app: unit-tests
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: unit-tests
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: unit-tests
+          image: localhost:5005/fnndsc/chris_streaming_tests:dev
+          imagePullPolicy: Always
+          args: ["-v", "--tb=short", "-m", "not integration and not e2e", "tests/"]

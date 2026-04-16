@@ -199,7 +199,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.event_forwarder
-    image: localhost/fnndsc/compute_event_forwarder
+    image: localhost/fnndsc/compute-event-forwarder
     environment:
       COMPUTE_ENV: docker
       DOCKER_LABEL_FILTER: org.chrisproject.miniChRIS
@@ -224,7 +224,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.status_consumer
-    image: localhost/fnndsc/compute_status_consumer
+    image: localhost/fnndsc/compute-status-consumer
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
@@ -246,7 +246,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.log_consumer
-    image: localhost/fnndsc/compute_logs_consumer
+    image: localhost/fnndsc/compute-logs-consumer
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT

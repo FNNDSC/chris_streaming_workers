@@ -1,0 +1,33 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-tests
+  namespace: chris-streaming
+  labels:
+    app: e2e-tests
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: e2e-tests
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: e2e-tests
+          image: localhost:5005/fnndsc/chris_streaming_tests:dev
+          imagePullPolicy: Always
+          args: ["-v", "--tb=long", "-m", "e2e", "-s", "tests/"]
+          env:
+            - name: SSE_SERVICE_URL
+              value: http://sse-service:8080
+            - name: PFCON_URL
+              value: http://pfcon:30005
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: DB_DSN
+              value: postgresql://chris:chris1234@postgres:5432/chris_streaming

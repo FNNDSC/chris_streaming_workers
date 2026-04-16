@@ -1,0 +1,41 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: status-consumer
+  namespace: chris-streaming
+  labels:
+    app: status-consumer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: status-consumer
+  template:
+    metadata:
+      labels:
+        app: status-consumer
+    spec:
+      containers:
+        - name: status-consumer
+          image: localhost:5005/fnndsc/compute-status-consumer:dev
+          imagePullPolicy: Always
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_PLAINTEXT
+            - name: KAFKA_SASL_MECHANISM
+              value: PLAIN
+            - name: KAFKA_SASL_USERNAME
+              value: status-consumer
+            - name: KAFKA_SASL_PASSWORD
+              value: status-consumer-secret
+            - name: KAFKA_CONSUMER_GROUP
+              value: status-consumer-group
+            - name: CELERY_BROKER_URL
+              value: redis://redis:6379/0
+            - name: MAX_RETRIES
+              value: "3"

@@ -1,0 +1,44 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-forwarder
+  namespace: chris-streaming
+  labels:
+    app: event-forwarder
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: event-forwarder
+  template:
+    metadata:
+      labels:
+        app: event-forwarder
+    spec:
+      serviceAccountName: event-forwarder
+      containers:
+        - name: event-forwarder
+          image: localhost:5005/fnndsc/compute-event-forwarder:dev
+          imagePullPolicy: Always
+          env:
+            - name: COMPUTE_ENV
+              value: kubernetes
+            - name: K8S_NAMESPACE
+              value: chris-streaming
+            - name: K8S_LABEL_SELECTOR
+              value: "chrisproject.org/role=plugininstance"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_PLAINTEXT
+            - name: KAFKA_SASL_MECHANISM
+              value: PLAIN
+            - name: KAFKA_SASL_USERNAME
+              value: event-forwarder
+            - name: KAFKA_SASL_PASSWORD
+              value: event-forwarder-secret
+            - name: EMIT_INITIAL_STATE
+              value: "true"

@@ -39,11 +39,11 @@ PostgreSQL + OpenSearch → SSE Service → Browser (historical replay on connec
 
 ### The three core workers
 
-- **Event Forwarder** (`compute_event_forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic as a best-effort hint that Fluent Bit has flushed all logs for a container (see the EOS section in [ARCHITECTURE.md](ARCHITECTURE.md) — cleanup does not depend on this alone). Stateless, idempotent, restart-safe with auto-reconnect.
+- **Event Forwarder** (`compute-event-forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic as a best-effort hint that Fluent Bit has flushed all logs for a container (see the EOS section in [ARCHITECTURE.md](ARCHITECTURE.md) — cleanup does not depend on this alone). Stateless, idempotent, restart-safe with auto-reconnect.
 
-- **Status Consumer** (`compute_status_consumer`) — Kafka consumer that reads status events and schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Failed messages go to a dead-letter topic after configurable retries.
+- **Status Consumer** (`compute-status-consumer`) — Kafka consumer that reads status events and schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Failed messages go to a dead-letter topic after configurable retries.
 
-- **Log Consumer** (`compute_logs_consumer`) — Batched Kafka consumer that reads log events (produced by Fluent Bit and EOS markers from Event Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker is received, flushes the current batch and sets a Redis key (`job:{id}:{type}:logs_flushed`) to signal that all logs have been written to OpenSearch. Configurable batch size and flush interval.
+- **Log Consumer** (`compute-logs-consumer`) — Batched Kafka consumer that reads log events (produced by Fluent Bit and EOS markers from Event Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker is received, flushes the current batch and sets a Redis key (`job:{id}:{type}:logs_flushed`) to signal that all logs have been written to OpenSearch. Configurable batch size and flush interval.
 
 ### Supporting components
 
@@ -72,9 +72,9 @@ chris_streaming_workers/
 ├── .dockerignore
 ├── README.md
 │
-├── Dockerfile.event_forwarder                  # Image: localhost/fnndsc/compute_event_forwarder
-├── Dockerfile.log_consumer                     # Image: localhost/fnndsc/compute_logs_consumer
-├── Dockerfile.status_consumer                  # Image: localhost/fnndsc/compute_status_consumer
+├── Dockerfile.event_forwarder                  # Image: localhost/fnndsc/compute-event-forwarder
+├── Dockerfile.log_consumer                     # Image: localhost/fnndsc/compute-logs-consumer
+├── Dockerfile.status_consumer                  # Image: localhost/fnndsc/compute-status-consumer
 ├── Dockerfile.sse_service                      # SSE + Celery worker image
 │
 ├── chris_streaming/                            # Python package root
@@ -140,8 +140,20 @@ chris_streaming_workers/
 │       ├── index.html                          # Job submission + status + log viewer
 │       └── app.js                              # SSE service client + EventSource SSE client
 │
-└── tests/
-    └── __init__.py
+├── tests/
+│   └── __init__.py
+│
+├── kubernetes/                                 # Kubernetes manifests (parallel to docker-compose)
+│   ├── README.md                               # K8s deployment and testing guide
+│   ├── kustomization.yaml                      # Kustomize entrypoint
+│   ├── 00-namespace.yaml
+│   ├── 20-infra/                               # Kafka, Redis, OpenSearch, Postgres, Fluent Bit
+│   ├── 30-pfcon/                               # pfcon with KubernetesManager
+│   ├── 40-workers/                             # Event forwarder, status/log consumers, SSE, celery
+│   ├── 50-ui/                                  # Test UI (nginx)
+│   └── tests/                                  # Unit/integration/e2e test Jobs + integration stack
+│
+└── justfile                                    # Task runner: `just up`, `just k8s-up`, `just run all-tests`, etc.
 ```
 
 ## Services in docker-compose
@@ -158,9 +170,9 @@ All 14 services run on a single `streaming` Docker network.
 | 6 | `fluent-bit` | `fluent/fluent-bit:3.2` | Docker log files → Kafka `job-logs` | 2020 (metrics) |
 | 7 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
 | 8 | `init-test-data` | `alpine:latest` | Creates sample fslink test data (run-once) | — |
-| 9 | `event-forwarder` | `localhost/fnndsc/compute_event_forwarder` | Docker events → Kafka `job-status-events` | — |
-| 10 | `status-consumer` | `localhost/fnndsc/compute_status_consumer` | Kafka → Celery | — |
-| 11 | `log-consumer` | `localhost/fnndsc/compute_logs_consumer` | Kafka → OpenSearch + Redis | — |
+| 9 | `event-forwarder` | `localhost/fnndsc/compute-event-forwarder` | Docker events → Kafka `job-status-events` | — |
+| 10 | `status-consumer` | `localhost/fnndsc/compute-status-consumer` | Kafka → Celery | — |
+| 11 | `log-consumer` | `localhost/fnndsc/compute-logs-consumer` | Kafka → OpenSearch + Redis | — |
 | 12 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming | 8080 |
 | 13 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
 | 14 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
@@ -192,6 +204,13 @@ Partitioning by `job_id` guarantees ordering of all events for a single job.
 SASL/PLAIN users (defined in `kafka_server_jaas.conf`): `event-forwarder` (write events + write EOS markers to job-logs), `log-producer` (Fluent Bit writes logs), `status-consumer` (read events), `log-consumer` (read logs). Each user has ACLs restricting them to only the operations they need.
 
 ## Development and testing
+
+### Kubernetes deployment
+
+A parallel Kubernetes pipeline has been made available under [kubernetes/](kubernetes/) and
+wrapped by `just k8s-*` recipes. See [kubernetes/README.md](kubernetes/README.md)
+for the full guide (bring-up, teardown, in-cluster test runs). The docker-compose
+pipeline described below is unaffected.
 
 ### Prerequisites
 

@@ -64,6 +64,16 @@ class TestJobTypeFromLabel:
         labels = {"org.chrisproject.job_type": ""}
         assert job_type_from_label(labels) is None
 
+    @pytest.mark.parametrize("value,expected", [
+        ("plugin", JobType.plugin),
+        ("copy", JobType.copy),
+        ("upload", JobType.upload),
+        ("delete", JobType.delete),
+    ])
+    def test_kubernetes_label_key(self, value, expected):
+        labels = {"chrisproject.org/job-type": value}
+        assert job_type_from_label(labels) == expected
+
 
 class TestResolveJobType:
     def test_label_takes_precedence(self):

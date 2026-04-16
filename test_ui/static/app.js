@@ -64,11 +64,13 @@ function updateStepTracker(currentStep, workflowStatus) {
         const stepEl = document.getElementById(`step-${i}`);
         if (!stepEl) continue;
         if (STEPS[i] === currentStep) {
-            stepEl.className = isNonSuccess ? 'step error' : 'step active';
+            if (currentStep === 'completed') {
+                stepEl.className = isNonSuccess ? 'step error' : 'step done';
+            } else {
+                stepEl.className = isNonSuccess ? 'step error' : 'step active';
+            }
         } else if (i < STEPS.indexOf(currentStep)) {
             stepEl.className = 'step done';
-        } else if (currentStep === 'completed') {
-            stepEl.className = isNonSuccess ? 'step error' : 'step done';
         } else {
             stepEl.className = 'step';
         }

@@ -1,0 +1,39 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: integration-tests
+  namespace: chris-streaming-test
+  labels:
+    app: integration-tests
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app: integration-tests
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: integration-tests
+          image: localhost:5005/fnndsc/chris_streaming_tests:dev
+          imagePullPolicy: Always
+          args: ["-v", "--tb=short", "-m", "integration", "tests/"]
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_PLAINTEXT
+            - name: KAFKA_SASL_MECHANISM
+              value: PLAIN
+            - name: KAFKA_SASL_USERNAME
+              value: admin
+            - name: KAFKA_SASL_PASSWORD
+              value: admin-secret
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: DB_DSN
+              value: postgresql://chris:chris1234@postgres:5432/chris_streaming_test

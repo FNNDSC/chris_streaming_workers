@@ -1,0 +1,62 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker
+  namespace: chris-streaming
+  labels:
+    app: celery-worker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: celery-worker
+  template:
+    metadata:
+      labels:
+        app: celery-worker
+    spec:
+      initContainers:
+        # worker_init runs synchronously at Celery startup and will crash the
+        # worker if postgres/redis/pfcon aren't reachable yet. Wait for them.
+        - name: wait-for-deps
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              until nc -z postgres 5432; do echo "waiting for postgres"; sleep 2; done
+              until nc -z redis 6379; do echo "waiting for redis"; sleep 2; done
+              until nc -z pfcon 30005; do echo "waiting for pfcon"; sleep 2; done
+              echo "all deps ready"
+      containers:
+        - name: celery-worker
+          image: localhost:5005/fnndsc/sse_service:dev
+          imagePullPolicy: Always
+          command: ["celery"]
+          args:
+            - "-A"
+            - "chris_streaming.sse_service.tasks"
+            - "worker"
+            - "-l"
+            - "info"
+            - "-Q"
+            - "status-processing"
+            - "-c"
+            - "2"
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: CELERY_BROKER_URL
+              value: redis://redis:6379/0
+            - name: DB_DSN
+              value: postgresql://chris:chris1234@postgres:5432/chris_streaming
+            - name: PFCON_URL
+              value: http://pfcon:30005
+            - name: PFCON_USER
+              value: pfcon
+            - name: PFCON_PASSWORD
+              value: pfcon1234

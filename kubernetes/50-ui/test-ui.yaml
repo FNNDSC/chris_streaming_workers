@@ -1,0 +1,54 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-ui
+  namespace: chris-streaming
+  labels:
+    app: test-ui
+spec:
+  type: NodePort
+  selector:
+    app: test-ui
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+      nodePort: 30888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-ui
+  namespace: chris-streaming
+  labels:
+    app: test-ui
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: test-ui
+  template:
+    metadata:
+      labels:
+        app: test-ui
+    spec:
+      containers:
+        - name: test-ui
+          image: localhost:5005/fnndsc/test_ui:dev
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8888
+          # Override the baked-in nginx.conf with the K8s-specific one
+          # (proxies only /sse/ to sse-service; no pfcon proxy).
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: nginx-k8s.conf
+              readOnly: true
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: test-ui-nginx

@@ -49,6 +49,12 @@ class EventForwarderSettings(KafkaSettings):
     emit_initial_state: bool = True
     # Delay before producing EOS marker (must exceed Fluent Bit flush cycle)
     eos_delay_seconds: float = 10.0
+    # Opt-in Docker reconciler: periodically inspect tracked containers
+    # and emit a status event if the mapped state disagrees with what
+    # we last emitted. Catches containers stuck in degenerate states
+    # (e.g. under heavily-overloaded Docker) that never fire die/kill.
+    # 0 disables the reconciler (default).
+    docker_reconcile_seconds: float = 0.0
 
 
 class StatusConsumerSettings(KafkaSettings):

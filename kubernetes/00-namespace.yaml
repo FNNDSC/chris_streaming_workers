@@ -1,0 +1,6 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chris-streaming
+  labels:
+    app.kubernetes.io/part-of: chris-streaming-workers

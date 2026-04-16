@@ -1,0 +1,174 @@
+# Run unit + integration tests (Docker Compose and Kubernetes/kind).
+# If all tests pass, build multi-arch images and push to DockerHub + GHCR.
+
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test-streamers:
+    name: tests (docker)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install just
+        uses: extractions/setup-just@v2
+      - name: Unit tests
+        run: just run unit-tests
+      - name: Integration tests
+        run: just run integration-tests
+
+  test-streamers-k8s:
+    name: tests (kubernetes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install just
+        uses: extractions/setup-just@v2
+      - name: Start local Docker registry
+        run: |
+          docker run -d --restart=always \
+            -p 127.0.0.1:5005:5000 \
+            --name chris-k8s-registry registry:2
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: chris-streaming
+          # Trust the host-side local registry from inside the kind node.
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            containerdConfigPatches:
+              - |-
+                [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5005"]
+                  endpoint = ["http://host.docker.internal:5005"]
+            nodes:
+              - role: control-plane
+                extraPortMappings:
+                  - containerPort: 30080
+                    hostPort: 30080
+                  - containerPort: 30888
+                    hostPort: 30888
+                  - containerPort: 30005
+                    hostPort: 30005
+      - name: Wire kind node DNS to host registry
+        run: |
+          # host.docker.internal isn't resolvable inside kind by default on Linux.
+          gateway_ip=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}')
+          for node in $(kind get nodes --name chris-streaming); do
+            docker exec "$node" sh -c "echo '$gateway_ip host.docker.internal' >> /etc/hosts"
+          done
+      - name: Build and push images to local registry
+        run: just k8s-build
+      - name: Unit tests (k8s)
+        run: just k8s-run unit-tests
+      - name: Integration tests (k8s)
+        run: just k8s-run integration-tests
+
+  build:
+    needs: [test-streamers, test-streamers-k8s]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta (event-forwarder)
+        id: meta-event-forwarder
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            docker.io/fnndsc/compute-event-forwarder
+            ghcr.io/fnndsc/compute-event-forwarder
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Docker meta (status-consumer)
+        id: meta-status-consumer
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            docker.io/fnndsc/compute-status-consumer
+            ghcr.io/fnndsc/compute-status-consumer
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Docker meta (logs-consumer)
+        id: meta-logs-consumer
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            docker.io/fnndsc/compute-logs-consumer
+            ghcr.io/fnndsc/compute-logs-consumer
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=pep440,pattern={{version}}
+            type=pep440,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to DockerHub
+        id: login-dockerhub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+      - name: Login to GitHub Container Registry
+        id: login-ghcr
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (event-forwarder)
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
+          context: .
+          file: ./Dockerfile.event_forwarder
+          platforms: linux/amd64,linux/arm64,linux/ppc64le
+          tags: ${{ steps.meta-event-forwarder.outputs.tags }}
+          labels: ${{ steps.meta-event-forwarder.outputs.labels }}
+          cache-from: type=gha,scope=event-forwarder
+          cache-to: type=gha,mode=max,scope=event-forwarder
+      - name: Build and push (status-consumer)
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
+          context: .
+          file: ./Dockerfile.status_consumer
+          platforms: linux/amd64,linux/arm64,linux/ppc64le
+          tags: ${{ steps.meta-status-consumer.outputs.tags }}
+          labels: ${{ steps.meta-status-consumer.outputs.labels }}
+          cache-from: type=gha,scope=status-consumer
+          cache-to: type=gha,mode=max,scope=status-consumer
+      - name: Build and push (logs-consumer)
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
+          context: .
+          file: ./Dockerfile.log_consumer
+          platforms: linux/amd64,linux/arm64,linux/ppc64le
+          tags: ${{ steps.meta-logs-consumer.outputs.tags }}
+          labels: ${{ steps.meta-logs-consumer.outputs.labels }}
+          cache-from: type=gha,scope=logs-consumer
+          cache-to: type=gha,mode=max,scope=logs-consumer

@@ -1,0 +1,45 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pfcon
+  namespace: chris-streaming
+  labels:
+    app: pfcon
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pfcon
+  namespace: chris-streaming
+  labels:
+    app: pfcon
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pfcon
+  namespace: chris-streaming
+  labels:
+    app: pfcon
+subjects:
+  - kind: ServiceAccount
+    name: pfcon
+    namespace: chris-streaming
+roleRef:
+  kind: Role
+  name: pfcon
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,73 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sse-service
+  namespace: chris-streaming
+  labels:
+    app: sse-service
+spec:
+  type: NodePort
+  selector:
+    app: sse-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sse-service
+  namespace: chris-streaming
+  labels:
+    app: sse-service
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sse-service
+  template:
+    metadata:
+      labels:
+        app: sse-service
+    spec:
+      containers:
+        - name: sse-service
+          image: localhost:5005/fnndsc/sse_service:dev
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: CELERY_BROKER_URL
+              value: redis://redis:6379/0
+            - name: DB_DSN
+              value: postgresql://chris:chris1234@postgres:5432/chris_streaming
+            - name: PFCON_URL
+              value: http://pfcon:30005
+            - name: PFCON_USER
+              value: pfcon
+            - name: PFCON_PASSWORD
+              value: pfcon1234
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20

@@ -1,0 +1,45 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-consumer
+  namespace: chris-streaming
+  labels:
+    app: log-consumer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: log-consumer
+  template:
+    metadata:
+      labels:
+        app: log-consumer
+    spec:
+      containers:
+        - name: log-consumer
+          image: localhost:5005/fnndsc/compute-logs-consumer:dev
+          imagePullPolicy: Always
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: kafka:9092
+            - name: KAFKA_SECURITY_PROTOCOL
+              value: SASL_PLAINTEXT
+            - name: KAFKA_SASL_MECHANISM
+              value: PLAIN
+            - name: KAFKA_SASL_USERNAME
+              value: log-consumer
+            - name: KAFKA_SASL_PASSWORD
+              value: log-consumer-secret
+            - name: KAFKA_CONSUMER_GROUP
+              value: log-consumer-group
+            - name: OPENSEARCH_URL
+              value: http://opensearch:9200
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: BATCH_MAX_SIZE
+              value: "200"
+            - name: BATCH_MAX_WAIT_SECONDS
+              value: "2.0"

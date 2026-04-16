@@ -1,0 +1,39 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: event-forwarder
+  namespace: chris-streaming
+  labels:
+    app: event-forwarder
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: event-forwarder
+  namespace: chris-streaming
+  labels:
+    app: event-forwarder
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: event-forwarder
+  namespace: chris-streaming
+  labels:
+    app: event-forwarder
+subjects:
+  - kind: ServiceAccount
+    name: event-forwarder
+    namespace: chris-streaming
+roleRef:
+  kind: Role
+  name: event-forwarder
+  apiGroup: rbac.authorization.k8s.io

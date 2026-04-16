@@ -23,14 +23,24 @@ import aiodocker
 
 from chris_streaming.common.container_naming import resolve_job_type
 from chris_streaming.common.pfcon_status import docker_event_to_status, docker_state_to_status
-from chris_streaming.common.schemas import StatusEvent
+from chris_streaming.common.schemas import JobStatus, StatusEvent
 from chris_streaming.common.settings import EventForwarderSettings
 from .watcher import Watcher
 
 logger = logging.getLogger(__name__)
 
-# Docker event types we care about
-_RELEVANT_EVENTS = {"create", "start", "die", "kill", "oom"}
+# Docker event types we care about. `destroy` is included so we can detect
+# containers that vanished without firing `die` (stuck/overloaded docker)
+# and report them as `undefined`.
+_RELEVANT_EVENTS = {"create", "start", "die", "kill", "oom", "destroy"}
+
+# Terminal JobStatus values that mean "no further status needed for this
+# container" — once observed we won't synthesize `undefined` on destroy.
+_TERMINAL_STATUSES = frozenset({
+    JobStatus.finishedSuccessfully,
+    JobStatus.finishedWithError,
+    JobStatus.undefined,
+})
 
 # Reconnect backoff
 _MAX_RECONNECT_WAIT = 60
@@ -43,6 +53,11 @@ class DockerWatcher(Watcher):
         self._settings = settings
         self._docker: Optional[aiodocker.Docker] = None
         self._label_filter = f"{settings.docker_label_filter}={settings.docker_label_value}"
+        # Last emitted status per container id. Used to:
+        #   1. synthesize `undefined` on `destroy` events that follow no
+        #      terminal event (container vanished unexpectedly).
+        #   2. deduplicate events produced by the periodic reconciler.
+        self._last_status: dict[str, JobStatus] = {}
 
     async def connect(self) -> None:
         self._docker = aiodocker.Docker()
@@ -56,35 +71,63 @@ class DockerWatcher(Watcher):
     async def watch(self) -> AsyncIterator[StatusEvent]:
         """
         Yield status events. First emits initial state of all matching
-        containers, then streams live events with auto-reconnect.
+        containers, then streams live events with auto-reconnect. When
+        ``docker_reconcile_seconds`` is non-zero, also runs a periodic
+        reconciler that inspects tracked containers and emits an event if
+        the current mapped state disagrees with what was last emitted.
         """
         if self._settings.emit_initial_state:
             async for event in self._emit_initial_state():
                 yield event
 
-        reconnect_attempt = 0
-        while True:
-            try:
-                async for event in self._watch_events():
-                    yield event
-                    reconnect_attempt = 0
-            except (aiodocker.exceptions.DockerError, ConnectionError, OSError) as e:
-                reconnect_attempt += 1
-                wait = min(2 ** reconnect_attempt, _MAX_RECONNECT_WAIT)
-                logger.warning(
-                    "Docker event stream disconnected: %s. Reconnecting in %ds (attempt %d)",
-                    e, wait, reconnect_attempt,
-                )
-                await asyncio.sleep(wait)
-                # Reconnect
+        queue: asyncio.Queue[StatusEvent] = asyncio.Queue()
+
+        async def run_events() -> None:
+            reconnect_attempt = 0
+            while True:
                 try:
-                    await self.close()
-                except Exception:
-                    pass
-                await self.connect()
-                # Re-emit current state after reconnect to catch missed events
-                async for event in self._emit_initial_state():
-                    yield event
+                    async for event in self._watch_events():
+                        await queue.put(event)
+                        reconnect_attempt = 0
+                except (aiodocker.exceptions.DockerError, ConnectionError, OSError) as e:
+                    reconnect_attempt += 1
+                    wait = min(2 ** reconnect_attempt, _MAX_RECONNECT_WAIT)
+                    logger.warning(
+                        "Docker event stream disconnected: %s. Reconnecting in %ds (attempt %d)",
+                        e, wait, reconnect_attempt,
+                    )
+                    await asyncio.sleep(wait)
+                    try:
+                        await self.close()
+                    except Exception:
+                        pass
+                    await self.connect()
+                    async for event in self._emit_initial_state():
+                        await queue.put(event)
+
+        events_task = asyncio.create_task(run_events())
+        reconciler_task: Optional[asyncio.Task] = None
+        interval = float(self._settings.docker_reconcile_seconds or 0.0)
+        if interval > 0:
+            async def run_reconciler() -> None:
+                while True:
+                    await asyncio.sleep(interval)
+                    try:
+                        async for event in self._reconcile():
+                            await queue.put(event)
+                    except Exception as e:
+                        logger.warning("Docker reconciler sweep failed: %s", e)
+
+            reconciler_task = asyncio.create_task(run_reconciler())
+            logger.info("Docker reconciler enabled (every %.1fs)", interval)
+
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            events_task.cancel()
+            if reconciler_task is not None:
+                reconciler_task.cancel()
 
     async def _emit_initial_state(self) -> AsyncIterator[StatusEvent]:
         """List all matching containers and emit their current status."""
@@ -96,6 +139,9 @@ class DockerWatcher(Watcher):
             info = await container.show()
             event = self._container_inspect_to_event(info)
             if event is not None:
+                cid = info.get("Id", "")
+                if cid:
+                    self._last_status[cid] = event.status
                 yield event
 
     async def _watch_events(self) -> AsyncIterator[StatusEvent]:
@@ -141,9 +187,18 @@ class DockerWatcher(Watcher):
             except (ValueError, TypeError):
                 exit_code = -1
 
-        job_status = docker_event_to_status(event_action, exit_code)
-        if job_status is None:
-            return None
+        # `destroy` only produces a status event when the container vanished
+        # without a prior terminal event — then we synthesize `undefined`.
+        if event_action == "destroy":
+            last = self._last_status.get(container_id)
+            self._last_status.pop(container_id, None)
+            if last in _TERMINAL_STATUSES:
+                return None
+            job_status = JobStatus.undefined
+        else:
+            job_status = docker_event_to_status(event_action, exit_code)
+            if job_status is None:
+                return None
 
         job_id, job_type = resolve_job_type(container_name, labels)
 
@@ -167,6 +222,10 @@ class DockerWatcher(Watcher):
         else:
             timestamp = datetime.now(timezone.utc)
 
+        # Destroy already popped the container from tracking; don't re-add.
+        if container_id and event_action != "destroy":
+            self._last_status[container_id] = job_status
+
         return StatusEvent(
             job_id=job_id,
             job_type=job_type,
@@ -178,6 +237,29 @@ class DockerWatcher(Watcher):
             timestamp=timestamp,
             source="docker",
         )
+
+    async def _reconcile(self) -> AsyncIterator[StatusEvent]:
+        """Inspect tracked containers and emit events for state drift.
+
+        For every container matching our label filter, computes the current
+        mapped status from its inspect payload and yields a StatusEvent if
+        the result differs from what we last emitted for that container id.
+        Catches containers that ended up in a degenerate state without
+        firing the usual die/kill/oom events (e.g. under overloaded Docker).
+        """
+        filters = {"label": [self._label_filter]}
+        containers = await self._docker.containers.list(all=True, filters=filters)
+        for container in containers:
+            info = await container.show()
+            event = self._container_inspect_to_event(info)
+            if event is None:
+                continue
+            cid = info.get("Id", "")
+            if self._last_status.get(cid) == event.status:
+                continue
+            if cid:
+                self._last_status[cid] = event.status
+            yield event
 
     def _container_inspect_to_event(self, info: dict) -> Optional[StatusEvent]:
         """Convert a container inspect dict to a StatusEvent (for initial state)."""

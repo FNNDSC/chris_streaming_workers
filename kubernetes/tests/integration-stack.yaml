@@ -1,0 +1,269 @@
+# Integration test infrastructure in chris-streaming-test namespace.
+# Standalone copy of kafka/redis/opensearch/postgres — no PVCs (ephemeral).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: chris-streaming-test
+  labels:
+    app: kafka
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka
+  ports:
+    - name: client
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: chris-streaming-test
+  labels:
+    app: kafka
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          env:
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/etc/kafka/jaas/kafka_server_jaas.conf"
+            - name: CLUSTER_ID
+              value: "chris-test-cluster-001"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              /opt/kafka/bin/kafka-storage.sh format \
+                --config /opt/kafka/config/server.properties \
+                --cluster-id "$CLUSTER_ID" \
+                --ignore-formatted
+              exec /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          volumeMounts:
+            - name: kafka-config
+              mountPath: /opt/kafka/config/server.properties
+              subPath: server.properties
+              readOnly: true
+            - name: kafka-config
+              mountPath: /etc/kafka/admin.properties
+              subPath: admin.properties
+              readOnly: true
+            - name: kafka-config
+              mountPath: /etc/kafka/jaas/kafka_server_jaas.conf
+              subPath: kafka_server_jaas.conf
+              readOnly: true
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /etc/kafka/admin.properties > /dev/null 2>&1
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 10
+            failureThreshold: 20
+      volumes:
+        - name: kafka-config
+          configMap:
+            name: kafka-config
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-init
+  namespace: chris-streaming-test
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: kafka-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-init
+          image: apache/kafka:3.9.0
+          command: ["bash", "/init/init-kafka.sh"]
+          volumeMounts:
+            - name: kafka-init
+              mountPath: /init/init-kafka.sh
+              subPath: init-kafka.sh
+              readOnly: true
+            - name: kafka-config
+              mountPath: /etc/kafka/admin.properties
+              subPath: admin.properties
+              readOnly: true
+      volumes:
+        - name: kafka-init
+          configMap:
+            name: kafka-init-script
+            defaultMode: 0755
+        - name: kafka-config
+          configMap:
+            name: kafka-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: chris-streaming-test
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: chris-streaming-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch
+  namespace: chris-streaming-test
+  labels:
+    app: opensearch
+spec:
+  selector:
+    app: opensearch
+  ports:
+    - port: 9200
+      targetPort: 9200
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensearch
+  namespace: chris-streaming-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opensearch
+  template:
+    metadata:
+      labels:
+        app: opensearch
+    spec:
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.18.0
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: DISABLE_SECURITY_PLUGIN
+              value: "true"
+            - name: OPENSEARCH_JAVA_OPTS
+              value: "-Xms256m -Xmx256m"
+          ports:
+            - containerPort: 9200
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 20
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: chris-streaming-test
+type: Opaque
+stringData:
+  POSTGRES_DB: chris_streaming_test
+  POSTGRES_USER: chris
+  POSTGRES_PASSWORD: chris1234
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: chris-streaming-test
+  labels:
+    app: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: chris-streaming-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 5
+            periodSeconds: 3

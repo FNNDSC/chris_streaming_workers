@@ -1,0 +1,56 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: chris-streaming
+
+resources:
+  - 00-namespace.yaml
+  - 20-infra/kafka.yaml
+  - 20-infra/opensearch.yaml
+  - 20-infra/redis.yaml
+  - 20-infra/postgres.yaml
+  - 20-infra/fluent-bit.yaml
+  - 30-pfcon/pfcon-rbac.yaml
+  - 30-pfcon/pfcon-storage.yaml
+  - 30-pfcon/pfcon.yaml
+  - 30-pfcon/init-test-data-job.yaml
+  - 40-workers/event-forwarder-rbac.yaml
+  - 40-workers/event-forwarder.yaml
+  - 40-workers/status-consumer.yaml
+  - 40-workers/log-consumer.yaml
+  - 40-workers/sse-service.yaml
+  - 40-workers/celery-worker.yaml
+  - 50-ui/test-ui.yaml
+
+configMapGenerator:
+  - name: kafka-config
+    namespace: chris-streaming
+    files:
+      - ../config/kafka/server.properties
+      - ../config/kafka/admin.properties
+      - ../config/kafka/kafka_server_jaas.conf
+  - name: kafka-init-script
+    namespace: chris-streaming
+    files:
+      - ../config/kafka/init-kafka.sh
+  - name: fluent-bit-config
+    namespace: chris-streaming
+    files:
+      - ../config/fluent-bit/fluent-bit-k8s.conf
+      - ../config/fluent-bit/parsers-k8s.conf
+      - ../config/fluent-bit/enrich-k8s.lua
+  - name: opensearch-index-template
+    namespace: chris-streaming
+    files:
+      - ../config/opensearch/index-template.json
+  - name: init-test-data-script
+    namespace: chris-streaming
+    files:
+      - ../config/init-test-data.sh
+  - name: test-ui-nginx
+    namespace: chris-streaming
+    files:
+      - ../test_ui/nginx-k8s.conf
+
+generatorOptions:
+  disableNameSuffixHash: true
