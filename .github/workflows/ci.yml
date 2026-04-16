@@ -85,43 +85,27 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: compute-event-forwarder
+            dockerfile: ./Dockerfile.event_forwarder
+          - image: compute-status-consumer
+            dockerfile: ./Dockerfile.status_consumer
+          - image: compute-logs-consumer
+            dockerfile: ./Dockerfile.log_consumer
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Docker meta (event-forwarder)
-        id: meta-event-forwarder
+      - name: Docker meta
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
-            docker.io/fnndsc/compute-event-forwarder
-            ghcr.io/fnndsc/compute-event-forwarder
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=pep440,pattern={{version}}
-            type=pep440,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: Docker meta (status-consumer)
-        id: meta-status-consumer
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            docker.io/fnndsc/compute-status-consumer
-            ghcr.io/fnndsc/compute-status-consumer
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=pep440,pattern={{version}}
-            type=pep440,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-      - name: Docker meta (logs-consumer)
-        id: meta-logs-consumer
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            docker.io/fnndsc/compute-logs-consumer
-            ghcr.io/fnndsc/compute-logs-consumer
+            docker.io/fnndsc/${{ matrix.image }}
+            ghcr.io/fnndsc/${{ matrix.image }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -147,36 +131,15 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (event-forwarder)
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
           context: .
-          file: ./Dockerfile.event_forwarder
-          platforms: linux/amd64,linux/arm64,linux/ppc64le
-          tags: ${{ steps.meta-event-forwarder.outputs.tags }}
-          labels: ${{ steps.meta-event-forwarder.outputs.labels }}
-          cache-from: type=gha,scope=event-forwarder
-          cache-to: type=gha,mode=max,scope=event-forwarder
-      - name: Build and push (status-consumer)
-        uses: docker/build-push-action@v6
-        with:
-          push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
-          context: .
-          file: ./Dockerfile.status_consumer
-          platforms: linux/amd64,linux/arm64,linux/ppc64le
-          tags: ${{ steps.meta-status-consumer.outputs.tags }}
-          labels: ${{ steps.meta-status-consumer.outputs.labels }}
-          cache-from: type=gha,scope=status-consumer
-          cache-to: type=gha,mode=max,scope=status-consumer
-      - name: Build and push (logs-consumer)
-        uses: docker/build-push-action@v6
-        with:
-          push: ${{ steps.login-dockerhub.outcome == 'success' && steps.login-ghcr.outcome == 'success' }}
-          context: .
-          file: ./Dockerfile.log_consumer
-          platforms: linux/amd64,linux/arm64,linux/ppc64le
-          tags: ${{ steps.meta-logs-consumer.outputs.tags }}
-          labels: ${{ steps.meta-logs-consumer.outputs.labels }}
-          cache-from: type=gha,scope=logs-consumer
-          cache-to: type=gha,mode=max,scope=logs-consumer
+          file: ${{ matrix.dockerfile }}
+          # Skip ppc64le on PRs (QEMU build adds ~5 min); full matrix on push/tag.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64,linux/arm64' || 'linux/amd64,linux/arm64,linux/ppc64le' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
