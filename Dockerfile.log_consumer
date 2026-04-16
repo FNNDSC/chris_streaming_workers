@@ -1,10 +1,21 @@
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+COPY pyproject.toml ./
+
+# gcc/python3-dev are required to build aiokafka's C extension from sdist
+# on ppc64le (no prebuilt wheel). Other architectures use prebuilt wheels
+# but the tooling is available as a fallback.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir --prefix=/install ".[log-consumer]"
+
 FROM python:3.12-slim
 
 WORKDIR /app
-
-COPY pyproject.toml ./
-RUN pip install --no-cache-dir ".[log-consumer]"
-
+COPY --from=builder /install /usr/local
 COPY chris_streaming/ chris_streaming/
 
 CMD ["python", "-m", "chris_streaming.log_consumer"]
