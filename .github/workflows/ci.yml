@@ -13,20 +13,28 @@ on:
 
 jobs:
   test-streamers:
-    name: tests (docker)
+    name: tests (docker, ${{ matrix.target }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [unit-tests, integration-tests, e2e-tests]
     steps:
       - uses: actions/checkout@v4
       - name: Install just
         uses: extractions/setup-just@v2
-      - name: Unit tests
-        run: just run unit-tests
-      - name: Integration tests
-        run: just run integration-tests
+      - name: ${{ matrix.target }}
+        run: just run ${{ matrix.target }}
 
   test-streamers-k8s:
-    name: tests (kubernetes)
+    name: tests (kubernetes, ${{ matrix.target }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [unit-tests, integration-tests, e2e-tests]
     steps:
       - uses: actions/checkout@v4
       - name: Install just
@@ -74,10 +82,8 @@ jobs:
           kubectl wait --for=condition=Ready nodes --all --timeout=120s
       - name: Build and push images to local registry
         run: just k8s-build
-      - name: Unit tests (k8s)
-        run: just k8s-run unit-tests
-      - name: Integration tests (k8s)
-        run: just k8s-run integration-tests
+      - name: ${{ matrix.target }} (k8s)
+        run: just k8s-run ${{ matrix.target }}
 
   build:
     needs: [test-streamers, test-streamers-k8s]
