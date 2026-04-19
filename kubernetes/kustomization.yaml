@@ -5,11 +5,9 @@ namespace: chris-streaming
 
 resources:
   - 00-namespace.yaml
-  - 20-infra/kafka.yaml
   - 20-infra/opensearch.yaml
   - 20-infra/redis.yaml
   - 20-infra/postgres.yaml
-  - 20-infra/fluent-bit.yaml
   - 30-pfcon/pfcon-rbac.yaml
   - 30-pfcon/pfcon-storage.yaml
   - 30-pfcon/pfcon.yaml
@@ -18,27 +16,12 @@ resources:
   - 40-workers/event-forwarder.yaml
   - 40-workers/status-consumer.yaml
   - 40-workers/log-consumer.yaml
+  - 40-workers/log-forwarder.yaml
   - 40-workers/sse-service.yaml
   - 40-workers/celery-worker.yaml
   - 50-ui/test-ui.yaml
 
 configMapGenerator:
-  - name: kafka-config
-    namespace: chris-streaming
-    files:
-      - ../config/kafka/server.properties
-      - ../config/kafka/admin.properties
-      - ../config/kafka/kafka_server_jaas.conf
-  - name: kafka-init-script
-    namespace: chris-streaming
-    files:
-      - ../config/kafka/init-kafka.sh
-  - name: fluent-bit-config
-    namespace: chris-streaming
-    files:
-      - ../config/fluent-bit/fluent-bit-k8s.conf
-      - ../config/fluent-bit/parsers-k8s.conf
-      - ../config/fluent-bit/enrich-k8s.lua
   - name: opensearch-index-template
     namespace: chris-streaming
     files:

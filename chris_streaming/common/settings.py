@@ -1,54 +1,56 @@
 """
 Centralized configuration loaded from environment variables.
 
-Each service imports only the settings class it needs. Common Kafka and Redis
-settings are shared; service-specific settings extend them.
+Each service imports only the settings class it needs. Redis Streams settings
+are shared; service-specific settings extend them. Redis Pub/Sub and the
+Celery broker reuse the same Redis connection.
 """
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
 
-class KafkaSettings(BaseSettings):
-    """Kafka connection and SASL/SCRAM-SHA-512 credentials."""
-    kafka_bootstrap_servers: str = "kafka:9092"
-    kafka_security_protocol: str = "SASL_PLAINTEXT"
-    kafka_sasl_mechanism: str = "PLAIN"
-    kafka_sasl_username: str = ""
-    kafka_sasl_password: str = ""
-
-    # Producer tuning
-    kafka_producer_acks: str = "all"
-    kafka_producer_compression: str = "lz4"
-    kafka_producer_linger_ms: int = 100
-    kafka_producer_batch_size: int = 16384
-    kafka_producer_enable_idempotence: bool = False
-
-    # Topics
-    kafka_topic_status: str = "job-status-events"
-    kafka_topic_logs: str = "job-logs"
-    kafka_topic_status_dlq: str = "job-status-events-dlq"
-    kafka_topic_logs_dlq: str = "job-logs-dlq"
-
-
 class RedisSettings(BaseSettings):
-    """Redis connection (used for both Pub/Sub and Celery broker)."""
+    """Redis connection (Pub/Sub, Streams, Celery broker all share it)."""
     redis_url: str = "redis://redis:6379/0"
 
 
-class EventForwarderSettings(KafkaSettings):
+class RedisStreamsSettings(RedisSettings):
+    """Redis Streams topology and tuning shared by all services."""
+    # Stream bases (per-shard streams are keyed as "{base}:{i}")
+    stream_status_base: str = "stream:job-status"
+    stream_logs_base: str = "stream:job-logs"
+    stream_status_dlq: str = "stream:job-status-dlq"
+    stream_logs_dlq: str = "stream:job-logs-dlq"
+
+    # Sharding
+    stream_num_shards: int = 8
+
+    # Retention (approximate MAXLEN trim on XADD)
+    stream_status_maxlen: int = 1_000_000
+    stream_logs_maxlen: int = 5_000_000
+    stream_dlq_maxlen: int = 100_000
+
+    # Reclaimer
+    reclaim_min_idle_ms: int = 30_000
+    reclaim_sweep_interval_ms: int = 10_000
+    reclaim_max_deliveries: int = 5
+
+    # Lease (horizontal scaling)
+    lease_ttl_ms: int = 15_000
+    lease_refresh_interval_ms: int = 5_000
+    lease_acquire_interval_ms: int = 2_000
+
+
+class EventForwarderSettings(RedisStreamsSettings):
     """Event Forwarder specific settings."""
     compute_env: str = Field("docker", description="docker or kubernetes")
     docker_label_filter: str = "org.chrisproject.miniChRIS"
     docker_label_value: str = "plugininstance"
     k8s_namespace: str = "default"
-    k8s_label_selector: str = "org.chrisproject.miniChRIS=plugininstance"
-    kafka_sasl_username: str = "event-forwarder"
-    kafka_sasl_password: str = "event-forwarder-secret"
+    k8s_label_selector: str = "chrisproject.org/role=plugininstance"
     # On startup, emit current state of all matching containers
     emit_initial_state: bool = True
-    # Delay before producing EOS marker (must exceed Fluent Bit flush cycle)
-    eos_delay_seconds: float = 10.0
     # Opt-in Docker reconciler: periodically inspect tracked containers
     # and emit a status event if the mapped state disagrees with what
     # we last emitted. Catches containers stuck in degenerate states
@@ -57,20 +59,18 @@ class EventForwarderSettings(KafkaSettings):
     docker_reconcile_seconds: float = 0.0
 
 
-class StatusConsumerSettings(KafkaSettings):
+class StatusConsumerSettings(RedisStreamsSettings):
     """Status Consumer specific settings."""
-    kafka_sasl_username: str = "status-consumer"
-    kafka_sasl_password: str = "status-consumer-secret"
-    kafka_consumer_group: str = "status-consumer-group"
-    max_retries: int = 3
+    status_consumer_group: str = "status-consumer-group"
+    # Handler retry policy (before a message is left in the PEL for reclaim).
+    handler_retries: int = 3
+    # Celery broker (same Redis instance in our setup)
     celery_broker_url: str = "redis://redis:6379/0"
 
 
-class LogConsumerSettings(KafkaSettings, RedisSettings):
+class LogConsumerSettings(RedisStreamsSettings):
     """Log Consumer specific settings."""
-    kafka_sasl_username: str = "log-consumer"
-    kafka_sasl_password: str = "log-consumer-secret"
-    kafka_consumer_group: str = "log-consumer-group"
+    log_consumer_group: str = "log-consumer-group"
     opensearch_url: str = "http://opensearch:9200"
     opensearch_index_prefix: str = "job-logs"
     # Batching: flush after this many messages or this many seconds
@@ -78,7 +78,16 @@ class LogConsumerSettings(KafkaSettings, RedisSettings):
     batch_max_wait_seconds: float = 2.0
 
 
-class SSEServiceSettings(RedisSettings):
+class LogForwarderSettings(RedisStreamsSettings):
+    """Log Forwarder specific settings."""
+    compute_env: str = Field("docker", description="docker or kubernetes")
+    docker_label_filter: str = "org.chrisproject.miniChRIS"
+    docker_label_value: str = "plugininstance"
+    k8s_namespace: str = "default"
+    k8s_label_selector: str = "chrisproject.org/role=plugininstance"
+
+
+class SSEServiceSettings(RedisStreamsSettings):
     """SSE Service and Celery Worker settings."""
     host: str = "0.0.0.0"
     port: int = 8080
@@ -94,3 +103,7 @@ class SSEServiceSettings(RedisSettings):
     # if a terminal per-step status has been stable for this many seconds
     # without a logs_flushed signal, treat the logs as drained and proceed.
     eos_quiescence_seconds: float = 10.0
+    # Consumer group names used by the /metrics endpoint (must match the
+    # values the status + log consumers register on startup).
+    status_consumer_group: str = "status-consumer-group"
+    log_consumer_group: str = "log-consumer-group"

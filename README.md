@@ -1,29 +1,29 @@
 # ChRIS Streaming Workers
 
-Event-driven streaming workers that replace ChRIS CUBE's polling-based job observability with a push/event-driven architecture. This repository implements three core long-running Kafka worker processes — **Event Forwarder**, **Status Consumer**, and **Log Consumer** — and the surrounding infrastructure to demonstrate them working within proper event and log pipelines.
+Event-driven streaming workers that replace ChRIS CUBE's polling-based job observability with a push/event-driven architecture. This repository implements four long-running async Python services — **Event Forwarder**, **Log Forwarder**, **Status Consumer** and **Log Consumer** — backed by **Redis Streams**, and the surrounding infrastructure to demonstrate them working within proper event and log pipelines.
 
 ## Overview
 
 In the current ChRIS architecture, CUBE polls pfcon every 5 seconds for every active plugin instance to check status and retrieve logs. This generates O(N) API calls per poll cycle (where N = active jobs), producing excessive database queries, enqueued Celery tasks, and heavy pressure on the Kubernetes/Docker API.
 
-This repository introduces a push-based alternative with two separate pipelines and event-driven workflow orchestration:
+This repository introduces a push-based alternative with two separate pipelines and event-driven workflow orchestration, all carried on **Redis Streams**:
 
 **Event Pipeline** (status changes):
 ```
-Docker/K8s Runtime → Event Forwarder → Kafka [job-status-events] → Status Consumer → Celery → Celery Worker → PostgreSQL + Redis Pub/Sub
+Docker/K8s Runtime → Event Forwarder → Redis Stream [stream:job-status:{shard}] → Status Consumer → Celery → Celery Worker → PostgreSQL + Redis Pub/Sub
 ```
 
 **Log Pipeline** (container output):
 ```
-Docker/K8s Runtime → Fluent Bit → Kafka [job-logs] → Log Consumer → OpenSearch + Redis Pub/Sub
-Event Forwarder → (delayed EOS marker) → Kafka [job-logs] → Log Consumer → Redis logs_flushed key
+Docker/K8s Runtime → Log Forwarder → Redis Stream [stream:job-logs:{shard}] → Log Consumer → OpenSearch + Redis Pub/Sub
+                                   └ (EOS on log-stream EOF) ┘                              └ SET logs_flushed (post-flush) ┘
 ```
 
 **Workflow Orchestration** (job lifecycle):
 ```
 UI → POST /api/jobs/{id}/run → SSE Service → Celery start_workflow → pfcon (copy)
                                                     ↓
-Docker events → Event Forwarder → Kafka → Status Consumer → Celery process_job_status
+Docker events → Event Forwarder → Redis Stream → Status Consumer → Celery process_job_status
                                                     ↓
                                           Workflow state machine:
                                           copy → plugin → upload → delete → cleanup → completed
@@ -37,98 +37,101 @@ Redis Pub/Sub → SSE Service → Browser (EventSource)
 PostgreSQL + OpenSearch → SSE Service → Browser (historical replay on connect)
 ```
 
-### The three core workers
+Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a given job live on one shard and preserve order, while total throughput scales with the number of shards. Consumers acquire a **lease** per shard (`SET NX PX` with heartbeat refresh) so every shard has exactly one live reader at a time. A background `PendingReclaimer` uses `XAUTOCLAIM`/`XPENDING` to recover messages left in the PEL by crashed consumers and routes them to a DLQ after `N` delivery attempts.
 
-- **Event Forwarder** (`compute-event-forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and produces structured status events to Kafka. For terminal events, also schedules delayed EOS (End-of-Stream) markers to the `job-logs` topic as a best-effort hint that Fluent Bit has flushed all logs for a container (see the EOS section in [ARCHITECTURE.md](ARCHITECTURE.md) — cleanup does not depend on this alone). Stateless, idempotent, restart-safe with auto-reconnect.
+### The four core workers
 
-- **Status Consumer** (`compute-status-consumer`) — Kafka consumer that reads status events and schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Failed messages go to a dead-letter topic after configurable retries.
+- **Event Forwarder** (`compute-event-forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and `XADD`s structured status events to the sharded `stream:job-status:{shard}` stream. Stateless, idempotent, restart-safe with auto-reconnect.
 
-- **Log Consumer** (`compute-logs-consumer`) — Batched Kafka consumer that reads log events (produced by Fluent Bit and EOS markers from Event Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker is received, flushes the current batch and sets a Redis key (`job:{id}:{type}:logs_flushed`) to signal that all logs have been written to OpenSearch. Configurable batch size and flush interval.
+- **Log Forwarder** (`compute-log-forwarder`) — Tails container stdout/stderr directly from the compute runtime (aiodocker for Docker, kubernetes-asyncio for K8s), filters by the same `org.chrisproject.miniChRIS=plugininstance` label selector used everywhere else, and `XADD`s each line to the sharded `stream:job-logs:{shard}` stream. When a container's log stream reaches EOF (container exited + buffers drained), emits a final `LogEvent` with `eos=true` on the same shard — this is the signal the Log Consumer uses to mark the container's logs as durable. Replaces the previous FluentBit-based log pipeline.
+
+- **Status Consumer** (`compute-status-consumer`) — Reads status events via `XREADGROUP` from the sharded status streams, then schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Each replica acquires a lease for a subset of shards; a `PendingReclaimer` recovers PEL entries from crashed workers and routes to `stream:job-status-dlq` after the configured retry budget.
+
+- **Log Consumer** (`compute-log-consumer`) — Batched Redis Streams consumer that reads log events from `stream:job-logs:{shard}` (lines and EOS markers, both produced by the Log Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker appears in the batch, SETs `job:{id}:{type}:logs_flushed` (TTL 1h) **after** the OpenSearch write succeeds so the key cannot fire ahead of the data it attests to. Configurable batch size and flush interval.
 
 ### Supporting components
 
 The repository also includes supporting infrastructure and a pilot test environment to demonstrate the full pipeline end-to-end:
 
-- **Kafka** (KRaft mode) with SASL/PLAIN authentication, per-service users, and ACLs
-- **Fluent Bit** reading Docker container logs, filtering by ChRIS labels, and forwarding to Kafka
-- **OpenSearch** for log storage and historical replay
-- **Redis** for Pub/Sub fan-out and Celery broker
-- **PostgreSQL** for durable status tracking (written by the Celery Worker)
-- **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/OpenSearch on connect, and exposes REST endpoints for workflow submission and status queries
+- **Redis** (single instance by default, with `appendonly yes` + `appendfsync everysec` for durability) — carries Streams (event + log transport), Pub/Sub fan-out, and the Celery broker. An opt-in Sentinel HA topology is provided at [kubernetes/20-infra/redis-ha.yaml](kubernetes/20-infra/redis-ha.yaml) (3 Redis replicas + 3 Sentinels), selectable via a `redis+sentinel://` URL.
+- **OpenSearch** for log storage and historical replay.
+- **PostgreSQL** for durable status tracking (written by the Celery Worker).
+- **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/OpenSearch on connect, exposes REST endpoints for workflow submission and status queries, and exposes a `/metrics` endpoint that reports per-shard stream depth, PEL depth, and DLQ length for both pipelines.
 - **Celery Worker** that processes status confirmations, orchestrates the workflow state machine (copy → plugin → upload → delete → cleanup), calls pfcon to advance steps, honours pfcon's `requires_copy_job` / `requires_upload_job` flags to skip optional steps, and waits for log flush (or terminal-status quiescence) before container cleanup. At cleanup time it computes the overall workflow status (`finishedSuccessfully`, `finishedWithError`, or `failed`) from the recorded per-step outcomes.
-- **pfcon** (`ghcr.io/fnndsc/pfcon:latest`, which includes `org.chrisproject.job_type` labels) as the job control plane
-- **Test UI** for submitting jobs via the SSE service and watching status + logs stream in real-time
+- **pfcon** (`ghcr.io/fnndsc/pfcon:latest`, which includes `org.chrisproject.job_type` labels) as the job control plane.
+- **Test UI** for submitting jobs via the SSE service and watching status + logs stream in real-time.
 
-For a detailed view of all data flows, message schemas, Kafka topic design, resilience properties, and the confirmed status flow, see [ARCHITECTURE.md](ARCHITECTURE.md).
+For a detailed view of all data flows, message schemas, Redis Streams topology, resilience properties, and the confirmed status flow, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Project structure
 
 ```
 chris_streaming_workers/
-├── pyproject.toml                              # Python deps: aiokafka, aiodocker, pydantic, fastapi, etc.
-├── docker-compose.yml                          # 14 services
+├── pyproject.toml                              # Python deps: redis.asyncio, aiodocker, pydantic, fastapi, etc.
+├── docker-compose.yml                          # Full application stack
+├── docker-compose.test.yml                     # Test stack (unit/integration/e2e)
+├── Justfile                                    # Task runner (just up, just run all-tests, just k8s-up, ...)
 ├── .env                                        # Credentials & config
 ├── .gitignore
 ├── .dockerignore
 ├── README.md
 │
 ├── Dockerfile.event_forwarder                  # Image: localhost/fnndsc/compute-event-forwarder
-├── Dockerfile.log_consumer                     # Image: localhost/fnndsc/compute-logs-consumer
+├── Dockerfile.log_consumer                     # Image: localhost/fnndsc/compute-log-consumer
 ├── Dockerfile.status_consumer                  # Image: localhost/fnndsc/compute-status-consumer
+├── Dockerfile.log_forwarder                    # Image: localhost/fnndsc/compute-log-forwarder
 ├── Dockerfile.sse_service                      # SSE + Celery worker image
 │
 ├── chris_streaming/                            # Python package root
 │   ├── __init__.py
 │   │
-│   ├── common/                                 # Shared modules (high code reuse)
+│   ├── common/                                 # Shared modules
 │   │   ├── __init__.py
-│   │   ├── kafka.py                            # Async Kafka producer/consumer factory
+│   │   ├── redis_stream.py                     # Redis client factory, ShardRouter, ShardLeaseManager, PendingReclaimer
+│   │   ├── stream_metrics.py                   # Per-shard XLEN/PEL/DLQ snapshot for /metrics
 │   │   ├── schemas.py                          # Pydantic models: StatusEvent, LogEvent, JobStatus
 │   │   ├── settings.py                         # pydantic-settings for env var parsing
 │   │   ├── pfcon_status.py                     # Docker/K8s state → pfcon JobStatus mapping
 │   │   └── container_naming.py                 # job_id ↔ container_name parsing
 │   │
-│   ├── event_forwarder/                        # Produces to job-status-events + EOS markers
+│   ├── event_forwarder/                        # Produces to stream:job-status
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.event_forwarder
 │   │   ├── watcher.py                          # Abstract async watcher protocol
 │   │   ├── docker_watcher.py                   # Docker event stream → StatusEvent
 │   │   ├── k8s_watcher.py                      # K8s Job watch API → StatusEvent
-│   │   ├── producer.py                         # Kafka producer with idempotence + dedup
-│   │   └── eos_producer.py                     # Delayed EOS markers → Kafka job-logs
+│   │   └── producer.py                         # XADD producer with idempotence + dedup
 │   │
-│   ├── status_consumer/                        # Consumes job-status-events
+│   ├── status_consumer/                        # Consumes stream:job-status
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.status_consumer
-│   │   ├── consumer.py                         # Kafka consumer with retry + DLQ
-│   │   └── notifier.py                         # Redis Pub/Sub + Celery task scheduling
+│   │   ├── consumer.py                         # XREADGROUP + lease + reclaimer + DLQ
+│   │   └── notifier.py                         # Celery task scheduling
 │   │
-│   ├── log_consumer/                           # Consumes job-logs
+│   ├── log_consumer/                           # Consumes stream:job-logs
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.log_consumer
-│   │   ├── consumer.py                         # Batched Kafka consumer
+│   │   ├── consumer.py                         # Batched XREADGROUP consumer
 │   │   ├── opensearch_writer.py                # Bulk writes with daily index rotation
 │   │   └── redis_publisher.py                  # Per-job Pub/Sub fan-out
+│   │
+│   ├── log_forwarder/                          # Produces to stream:job-logs (lines + EOS)
+│   │   ├── __init__.py
+│   │   ├── __main__.py                         # python -m chris_streaming.log_forwarder
+│   │   ├── forwarder.py                        # Serializes LogLine → LogEvent and XADDs
+│   │   ├── tailer.py                           # aiodocker log stream → LogLine (+ EOS on EOF)
+│   │   └── k8s_tailer.py                       # kubernetes-asyncio pod logs → LogLine (+ EOS on EOF)
 │   │
 │   └── sse_service/                            # FastAPI SSE service + Celery tasks
 │       ├── __init__.py
 │       ├── __main__.py                         # python -m chris_streaming.sse_service
 │       ├── app.py                              # FastAPI app with CORS
-│       ├── routes.py                           # SSE + REST endpoints (run, workflow, history)
+│       ├── routes.py                           # SSE + REST endpoints (run, workflow, history, metrics)
 │       ├── redis_subscriber.py                 # Async Redis subscriber with historical replay
 │       ├── pfcon_client.py                     # Synchronous HTTP client for pfcon REST API
 │       └── tasks.py                            # Celery tasks: process_job_status, start_workflow, cleanup_containers
 │
 ├── config/
-│   ├── kafka/
-│   │   ├── server.properties                   # KRaft broker config (SASL/PLAIN, ACLs)
-│   │   ├── kafka_server_jaas.conf              # SASL/PLAIN user credentials
-│   │   ├── init-kafka.sh                       # Create topics and ACLs (run-once)
-│   │   └── admin.properties                    # SASL config for kafka CLI tools
-│   ├── fluent-bit/
-│   │   ├── fluent-bit.conf                     # Input, filter, output pipeline
-│   │   ├── parsers.conf                        # Docker JSON log parser
-│   │   └── enrich.lua                          # Lua filter: metadata + schema reshaping
 │   ├── opensearch/
 │   │   └── index-template.json                 # job-logs-* index mapping
 │   └── init-test-data.sh                       # Create sample files in storeBase
@@ -141,73 +144,72 @@ chris_streaming_workers/
 │       └── app.js                              # SSE service client + EventSource SSE client
 │
 ├── tests/
-│   └── __init__.py
+│   ├── conftest.py
+│   ├── unit/                                   # Pure unit tests (no network)
+│   ├── integration/                            # Redis, OpenSearch, PostgreSQL integration tests
+│   └── e2e/                                    # Full-stack workflow tests
 │
-├── kubernetes/                                 # Kubernetes manifests (parallel to docker-compose)
-│   ├── README.md                               # K8s deployment and testing guide
-│   ├── kustomization.yaml                      # Kustomize entrypoint
-│   ├── 00-namespace.yaml
-│   ├── 20-infra/                               # Kafka, Redis, OpenSearch, Postgres, Fluent Bit
-│   ├── 30-pfcon/                               # pfcon with KubernetesManager
-│   ├── 40-workers/                             # Event forwarder, status/log consumers, SSE, celery
-│   ├── 50-ui/                                  # Test UI (nginx)
-│   └── tests/                                  # Unit/integration/e2e test Jobs + integration stack
-│
-└── justfile                                    # Task runner: `just up`, `just k8s-up`, `just run all-tests`, etc.
+└── kubernetes/                                 # Kubernetes manifests (parallel to docker-compose)
+    ├── README.md                               # K8s deployment and testing guide
+    ├── kustomization.yaml                      # Kustomize entrypoint
+    ├── 00-namespace.yaml
+    ├── 20-infra/                               # Redis (+ optional redis-ha), OpenSearch, Postgres
+    ├── 30-pfcon/                               # pfcon with KubernetesManager
+    ├── 40-workers/                             # event-forwarder, status/log consumers, log-forwarder, SSE, celery
+    ├── 50-ui/                                  # Test UI (nginx)
+    └── tests/                                  # Unit/integration/e2e test Jobs + integration stack
 ```
 
 ## Services in docker-compose
 
-All 14 services run on a single `streaming` Docker network.
+All services run on a single `streaming` Docker network.
 
 | # | Service | Image | Role | Exposed Ports |
 |---|---------|-------|------|---------------|
-| 1 | `kafka` | `apache/kafka:3.9.0` | KRaft broker with SASL/PLAIN | 9092 |
-| 2 | `kafka-init` | `apache/kafka:3.9.0` | Creates topics and ACLs (run-once) | — |
-| 3 | `opensearch` | `opensearchproject/opensearch:2.18.0` | Log storage and search | 9200 |
-| 4 | `redis` | `redis:7-alpine` | Pub/Sub fan-out + Celery broker | 6379 |
-| 5 | `postgres` | `postgres:16-alpine` | Celery worker DB | 5433 |
-| 6 | `fluent-bit` | `fluent/fluent-bit:3.2` | Docker log files → Kafka `job-logs` | 2020 (metrics) |
-| 7 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
-| 8 | `init-test-data` | `alpine:latest` | Creates sample fslink test data (run-once) | — |
-| 9 | `event-forwarder` | `localhost/fnndsc/compute-event-forwarder` | Docker events → Kafka `job-status-events` | — |
-| 10 | `status-consumer` | `localhost/fnndsc/compute-status-consumer` | Kafka → Celery | — |
-| 11 | `log-consumer` | `localhost/fnndsc/compute-logs-consumer` | Kafka → OpenSearch + Redis | — |
-| 12 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming | 8080 |
-| 13 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
-| 14 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
+| 1 | `redis` | `redis:7-alpine` | Streams transport + Pub/Sub + Celery broker (AOF everysec) | 6379 |
+| 2 | `opensearch` | `opensearchproject/opensearch:2.18.0` | Log storage and search | 9200 |
+| 3 | `postgres` | `postgres:16-alpine` | Celery worker DB | 5433 |
+| 4 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
+| 5 | `init-test-data` | `alpine:latest` | Creates sample fslink test data (run-once) | — |
+| 6 | `event-forwarder` | `localhost/fnndsc/compute-event-forwarder` | Docker events → `stream:job-status` | — |
+| 7 | `log-forwarder` | `localhost/fnndsc/compute-log-forwarder` | Docker container logs → `stream:job-logs` | — |
+| 8 | `status-consumer` | `localhost/fnndsc/compute-status-consumer` | `stream:job-status` → Celery | — |
+| 9 | `log-consumer` | `localhost/fnndsc/compute-log-consumer` | `stream:job-logs` → OpenSearch + Redis Pub/Sub | — |
+| 10 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming + `/metrics` | 8080 |
+| 11 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
+| 12 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
 
 ### Dependency graph
 
 ```
 init-test-data ──→ pfcon
-kafka ──→ kafka-init ──→ event-forwarder
-                     ├──→ status-consumer
-                     ├──→ log-consumer    (also needs opensearch, redis)
-                     └──→ fluent-bit
+redis ──→ event-forwarder
+      ├──→ log-forwarder
+      ├──→ status-consumer
+      └──→ log-consumer    (also needs opensearch)
 redis + postgres + pfcon ──→ celery-worker
 redis + postgres ──→ sse-service
 sse-service ──→ test-ui
 ```
 
-### Kafka design
+### Redis Streams design
 
-| Topic | Partitions | Retention | Key | Purpose |
-|-------|-----------|-----------|-----|---------|
-| `job-status-events` | 12 | 3 days | `job_id` | Status transitions from Event Forwarder |
-| `job-logs` | 12 | 3 days | `job_id` | Log lines from Fluent Bit |
-| `job-status-events-dlq` | 3 | 7 days | `job_id` | Failed status messages |
-| `job-logs-dlq` | 3 | 7 days | `job_id` | Failed log messages |
+All streams use `md5(job_id) mod N` as the shard key, guaranteeing per-job ordering.
 
-Partitioning by `job_id` guarantees ordering of all events for a single job.
+| Stream base | Shards | Trim policy | Writers | Readers |
+|-------------|--------|-------------|---------|---------|
+| `stream:job-status:{shard}` | `STREAM_NUM_SHARDS` (default 8) | `MAXLEN ~ STREAM_STATUS_MAXLEN` (default 1M) | Event Forwarder | Status Consumer |
+| `stream:job-logs:{shard}` | `STREAM_NUM_SHARDS` (default 8) | `MAXLEN ~ STREAM_LOGS_MAXLEN` (default 5M) | Log Forwarder (lines + EOS markers) | Log Consumer |
+| `stream:job-status-dlq` | 1 | `MAXLEN ~ STREAM_DLQ_MAXLEN` (default 100k) | Status Consumer (via reclaimer) | (manual inspection) |
+| `stream:job-logs-dlq` | 1 | `MAXLEN ~ STREAM_DLQ_MAXLEN` (default 100k) | Log Consumer (via reclaimer) | (manual inspection) |
 
-SASL/PLAIN users (defined in `kafka_server_jaas.conf`): `event-forwarder` (write events + write EOS markers to job-logs), `log-producer` (Fluent Bit writes logs), `status-consumer` (read events), `log-consumer` (read logs). Each user has ACLs restricting them to only the operations they need.
+Consumer groups: `status-consumer-group`, `log-consumer-group` (created with `MKSTREAM` on startup). Per-shard `lease:<stream>:<group>` keys gate which replica owns which shard. A `PendingReclaimer` background task uses `XAUTOCLAIM`/`XPENDING` to recover entries left in the PEL by crashed consumers and routes messages to the DLQ after `RECLAIM_MAX_DELIVERIES`.
 
 ## Development and testing
 
 ### Kubernetes deployment
 
-A parallel Kubernetes pipeline has been made available under [kubernetes/](kubernetes/) and
+A parallel Kubernetes pipeline is available under [kubernetes/](kubernetes/) and
 wrapped by `just k8s-*` recipes. See [kubernetes/README.md](kubernetes/README.md)
 for the full guide (bring-up, teardown, in-cluster test runs). The docker-compose
 pipeline described below is unaffected.
@@ -228,7 +230,7 @@ or without just:
 docker compose up --build -d
 ```
 
-This builds the custom service images, pulls infrastructure images (including pfcon), initializes Kafka topics/users, creates test data, and launches all services.
+This builds the custom service images, pulls infrastructure images (including pfcon), creates test data, and launches all services.
 
 ### Access points
 
@@ -236,6 +238,7 @@ This builds the custom service images, pulls infrastructure images (including pf
 |-----|---------|
 | http://localhost:8888 | Test UI — submit jobs, watch status + logs |
 | http://localhost:8080/health | SSE Service health check |
+| http://localhost:8080/metrics | Per-shard stream depth / PEL / DLQ snapshot |
 | http://localhost:8080/api/jobs/{job_id}/run | Submit a workflow (POST) |
 | http://localhost:8080/api/jobs/{job_id}/workflow | Workflow status (GET) |
 | http://localhost:8080/api/jobs/{job_id}/status/history | Status history (GET) |
@@ -278,21 +281,28 @@ curl -s http://localhost:8080/api/jobs/my-job-1/status/history | jq
 
 # Stream SSE events (including historical replay for late-connecting clients)
 curl -N http://localhost:8080/events/my-job-1/all
+
+# Observe stream / PEL / DLQ depth
+curl -s http://localhost:8080/metrics | jq
 ```
 
 ### Inspect the pipeline internals
 
 ```bash
-# Check Kafka topics
-docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server localhost:9092 \
-  --command-config /etc/kafka/admin.properties --list
+# List streams and their lengths
+docker compose exec redis redis-cli --scan --pattern 'stream:job-*' | \
+  xargs -I {} sh -c 'echo "{} -> $(docker compose exec -T redis redis-cli XLEN {})"'
 
-# Read status events from Kafka
-docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --consumer.config /etc/kafka/admin.properties \
-  --topic job-status-events --from-beginning --max-messages 10
+# Inspect a shard's consumer-group state
+docker compose exec redis redis-cli XINFO GROUPS stream:job-status:0
+docker compose exec redis redis-cli XPENDING stream:job-status:0 status-consumer-group
+
+# Tail new entries from a status shard (blocks)
+docker compose exec redis redis-cli XREAD BLOCK 0 COUNT 10 STREAMS stream:job-status:0 \$
+
+# DLQ inspection
+docker compose exec redis redis-cli XLEN stream:job-status-dlq
+docker compose exec redis redis-cli XRANGE stream:job-status-dlq - + COUNT 10
 
 # Query PostgreSQL for job statuses
 docker compose exec postgres psql -U chris chris_streaming \
@@ -300,9 +310,6 @@ docker compose exec postgres psql -U chris chris_streaming \
 
 # Query OpenSearch for logs
 curl -s 'http://localhost:9200/job-logs-*/_search?q=job_id:test-job-1&sort=timestamp:asc&size=20' | jq '.hits.hits[]._source.line'
-
-# Check Fluent Bit metrics
-curl -s http://localhost:2020/api/v1/metrics
 ```
 
 ### Stop and clean up
@@ -320,17 +327,17 @@ docker compose down -v # stop and remove all volumes (full reset)
 
 ### Running automated tests
 
-Tests are split into three levels — **unit tests** (no infrastructure, fast), **integration tests** (require Kafka, Redis, OpenSearch, PostgreSQL), and **end-to-end tests** (require the full application stack). All run entirely in Docker via `docker-compose.test.yml` and `Dockerfile.test`, using Docker Compose profiles to start only the services needed for each level.
+Tests are split into three levels — **unit tests** (no infrastructure, fast), **integration tests** (require Redis, OpenSearch, PostgreSQL), and **end-to-end tests** (require the full application stack). All run entirely in Docker via `docker-compose.test.yml` and `Dockerfile.test`, using Docker Compose profiles to start only the services needed for each level.
 
 #### Using `just` (recommended)
 
 Install [just](https://github.com/casey/just), then:
 
 ```bash
-# Run unit tests (no infrastructure needed, ~1s)
+# Run unit tests (no infrastructure needed, fast)
 just run unit-tests
 
-# Run integration tests (spins up Kafka, Redis, OpenSearch, PostgreSQL)
+# Run integration tests (spins up Redis, OpenSearch, PostgreSQL)
 just run integration-tests
 
 # Run E2E tests (starts full application stack, submits real workflows)
@@ -366,23 +373,24 @@ docker compose down
 tests/
 ├── conftest.py                           # Shared fixtures (sample events)
 ├── unit/                                 # No external services required
-│   ├── test_common/                      # schemas, pfcon_status, container_naming, settings, kafka
-│   ├── test_event_forwarder/             # producer, eos_producer, docker_watcher
+│   ├── test_common/                      # schemas, pfcon_status, container_naming, settings, redis_stream, stream_metrics
+│   ├── test_event_forwarder/             # producer, docker_watcher, k8s_watcher
 │   ├── test_status_consumer/             # consumer, notifier
 │   ├── test_log_consumer/                # consumer, opensearch_writer, redis_publisher
+│   ├── test_log_forwarder/               # forwarder, tailer
 │   └── test_sse_service/                 # app, routes, pfcon_client, tasks
 ├── integration/                          # Requires Docker Compose infrastructure
-│   ├── test_kafka_roundtrip.py           # Produce/consume through real Kafka
-│   ├── test_redis_pubsub.py             # Pub/Sub and key operations
+│   ├── test_redis_streams_roundtrip.py   # XADD / XREADGROUP / XACK + reclaimer + DLQ
+│   ├── test_redis_pubsub.py              # Pub/Sub and key operations
 │   ├── test_opensearch_writer.py         # Bulk writes and queries
 │   ├── test_postgres.py                  # Schema creation and upsert logic
-│   └── test_sse_health.py               # FastAPI health endpoint
+│   └── test_sse_health.py                # FastAPI health endpoint
 └── e2e/                                  # Requires full application stack
     └── test_workflow_e2e.py              # Submit workflows, verify SSE events + logs
 ```
 
-- **Unit tests** use mocks exclusively — no network or container dependencies.
-- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Kafka produce/consume, Redis Pub/Sub, OpenSearch bulk writes, PostgreSQL upserts).
+- **Unit tests** use `fakeredis` and mocks exclusively — no network or container dependencies.
+- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Redis Streams XADD/XREADGROUP/XACK, Redis Pub/Sub, OpenSearch bulk writes, PostgreSQL upserts, reclaimer + DLQ behavior).
 - **E2E tests** are marked with `@pytest.mark.e2e` and exercise the full pipeline: submit a job via `POST /api/jobs/{id}/run`, verify status events arrive through the SSE stream, check workflow completion, and confirm logs appear in OpenSearch. Includes tests for successful workflows, failure scenarios (bad image), and historical replay for late-connecting SSE clients.
 
 
@@ -390,21 +398,27 @@ tests/
 
 All services are configured via environment variables. The `.env` file provides defaults for the Docker Compose deployment.
 
-### Shared Kafka settings
+### Shared Redis Streams settings
 
-Used by: Event Forwarder, Status Consumer, Log Consumer
+Used by: Event Forwarder, Log Forwarder, Status Consumer, Log Consumer, SSE Service.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KAFKA_BOOTSTRAP_SERVERS` | `kafka:9092` | Kafka broker address |
-| `KAFKA_SECURITY_PROTOCOL` | `SASL_PLAINTEXT` | `SASL_PLAINTEXT` for dev, `SASL_SSL` for production |
-| `KAFKA_SASL_MECHANISM` | `PLAIN` | SASL mechanism |
-| `KAFKA_SASL_USERNAME` | *(per service)* | SASL/PLAIN username |
-| `KAFKA_SASL_PASSWORD` | *(per service)* | SASL/PLAIN password |
-| `KAFKA_TOPIC_STATUS` | `job-status-events` | Status events topic |
-| `KAFKA_TOPIC_LOGS` | `job-logs` | Log events topic |
-| `KAFKA_TOPIC_STATUS_DLQ` | `job-status-events-dlq` | Status dead-letter topic |
-| `KAFKA_TOPIC_LOGS_DLQ` | `job-logs-dlq` | Logs dead-letter topic |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis connection URL. Set to `redis+sentinel://host1:26379,host2:26379/mymaster/0` to resolve the current master via a Sentinel cluster. |
+| `STREAM_STATUS_BASE` | `stream:job-status` | Status stream base; sharded as `{base}:{i}` |
+| `STREAM_LOGS_BASE` | `stream:job-logs` | Log stream base; sharded as `{base}:{i}` |
+| `STREAM_STATUS_DLQ` | `stream:job-status-dlq` | Status dead-letter stream |
+| `STREAM_LOGS_DLQ` | `stream:job-logs-dlq` | Log dead-letter stream |
+| `STREAM_NUM_SHARDS` | `8` | Number of shards per stream base (stable `md5(job_id) mod N`) |
+| `STREAM_STATUS_MAXLEN` | `1000000` | Approximate per-shard cap applied via `XADD MAXLEN ~` |
+| `STREAM_LOGS_MAXLEN` | `5000000` | Approximate per-shard cap applied via `XADD MAXLEN ~` |
+| `STREAM_DLQ_MAXLEN` | `100000` | Approximate DLQ cap |
+| `RECLAIM_MIN_IDLE_MS` | `30000` | PEL entries idle longer than this are eligible for `XAUTOCLAIM` |
+| `RECLAIM_SWEEP_INTERVAL_MS` | `10000` | How often the reclaimer runs |
+| `RECLAIM_MAX_DELIVERIES` | `5` | After N deliveries, the reclaimer moves the message to the DLQ |
+| `LEASE_TTL_MS` | `15000` | Shard-lease TTL |
+| `LEASE_REFRESH_INTERVAL_MS` | `5000` | How often the owner refreshes its lease |
+| `LEASE_ACQUIRE_INTERVAL_MS` | `2000` | How often a replica tries to pick up an unowned shard |
 
 ### Event Forwarder
 
@@ -414,33 +428,39 @@ Used by: Event Forwarder, Status Consumer, Log Consumer
 | `DOCKER_LABEL_FILTER` | `org.chrisproject.miniChRIS` | Docker label key to filter containers |
 | `DOCKER_LABEL_VALUE` | `plugininstance` | Expected value for the filter label |
 | `K8S_NAMESPACE` | `default` | Kubernetes namespace (when `COMPUTE_ENV=kubernetes`) |
-| `K8S_LABEL_SELECTOR` | `org.chrisproject.miniChRIS=plugininstance` | K8s label selector |
+| `K8S_LABEL_SELECTOR` | `chrisproject.org/role=plugininstance` | K8s label selector (K8s-idiomatic `domain/key` form; differs from the Docker flat-key label) |
 | `EMIT_INITIAL_STATE` | `true` | Emit current state of all containers on startup |
-| `EOS_DELAY_SECONDS` | `10.0` | Delay before sending EOS marker to job-logs (seconds) |
-| `KAFKA_SASL_USERNAME` | `event-forwarder` | Kafka SASL/PLAIN user |
-| `KAFKA_SASL_PASSWORD` | `event-forwarder-secret` | Kafka SASL/PLAIN password |
+| `DOCKER_RECONCILE_SECONDS` | `0.0` | If > 0, periodically inspect tracked containers and re-emit a status if the mapped state disagrees with last-emitted (0 disables) |
 
 Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in-cluster K8s config (Kubernetes mode).
+
+### Log Forwarder
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMPUTE_ENV` | `docker` | `docker` or `kubernetes` |
+| `DOCKER_LABEL_FILTER` | `org.chrisproject.miniChRIS` | Docker label key to filter containers |
+| `DOCKER_LABEL_VALUE` | `plugininstance` | Expected value for the filter label |
+| `K8S_NAMESPACE` | `default` | Kubernetes namespace (when `COMPUTE_ENV=kubernetes`) |
+| `K8S_LABEL_SELECTOR` | `chrisproject.org/role=plugininstance` | K8s label selector (K8s-idiomatic `domain/key` form; differs from the Docker flat-key label) |
+
+Requires the Docker socket (Docker mode) or in-cluster K8s config (Kubernetes mode).
 
 ### Status Consumer
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KAFKA_SASL_USERNAME` | `status-consumer` | Kafka SASL/PLAIN user |
-| `KAFKA_SASL_PASSWORD` | `status-consumer-secret` | Kafka SASL/PLAIN password |
-| `KAFKA_CONSUMER_GROUP` | `status-consumer-group` | Kafka consumer group ID |
+| `STATUS_CONSUMER_GROUP` | `status-consumer-group` | Consumer group name |
+| `HANDLER_RETRIES` | `3` | In-process retries before a message is left in the PEL for reclaim |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker URL |
-| `MAX_RETRIES` | `3` | Retries before sending to DLQ |
 
 ### Log Consumer
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KAFKA_SASL_USERNAME` | `log-consumer` | Kafka SASL/PLAIN user |
-| `KAFKA_SASL_PASSWORD` | `log-consumer-secret` | Kafka SASL/PLAIN password |
-| `KAFKA_CONSUMER_GROUP` | `log-consumer-group` | Kafka consumer group ID |
+| `LOG_CONSUMER_GROUP` | `log-consumer-group` | Consumer group name |
 | `OPENSEARCH_URL` | `http://opensearch:9200` | OpenSearch endpoint |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for Pub/Sub |
+| `OPENSEARCH_INDEX_PREFIX` | `job-logs` | Daily index prefix (`job-logs-YYYY.MM.DD`) |
 | `BATCH_MAX_SIZE` | `200` | Max messages per batch before flush |
 | `BATCH_MAX_WAIT_SECONDS` | `2.0` | Max seconds before flushing a partial batch |
 
@@ -450,14 +470,16 @@ Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in
 |----------|---------|-------------|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8080` | Bind port |
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for Pub/Sub subscriptions |
 | `OPENSEARCH_URL` | `http://opensearch:9200` | OpenSearch for historical log queries |
+| `OPENSEARCH_INDEX_PREFIX` | `job-logs` | Index prefix matching the Log Consumer |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker |
 | `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
 | `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |
 | `PFCON_USER` | `pfcon` | pfcon API username |
 | `PFCON_PASSWORD` | `pfcon1234` | pfcon API password |
 | `EOS_QUIESCENCE_SECONDS` | `10.0` | Fallback window used by `cleanup_containers`: if no `logs_flushed` key appears, a step whose terminal status has been stable for this long is treated as drained. EOS is a hint, not a hard gate. |
+| `STATUS_CONSUMER_GROUP` | `status-consumer-group` | Used by `/metrics` to read PEL depth — must match the Status Consumer's value |
+| `LOG_CONSUMER_GROUP` | `log-consumer-group` | Used by `/metrics` to read PEL depth — must match the Log Consumer's value |
 
 ### Celery Worker
 
@@ -475,16 +497,6 @@ celery -A chris_streaming.sse_service.tasks worker -l info -Q status-processing 
 | `PFCON_USER` | `pfcon` | pfcon API username |
 | `PFCON_PASSWORD` | `pfcon1234` | pfcon API password |
 
-### Fluent Bit
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KAFKA_BROKERS` | `kafka:9092` | Kafka broker address |
-| `KAFKA_SASL_USERNAME` | `log-producer` | Kafka SASL/PLAIN user |
-| `KAFKA_SASL_PASSWORD` | `log-producer-secret` | Kafka SASL/PLAIN password |
-
-Requires `/var/lib/docker/containers` and `/var/run/docker.sock` mounted read-only.
-
 ### pfcon
 
 | Variable | Default | Description |
@@ -496,12 +508,6 @@ Requires `/var/lib/docker/containers` and `/var/run/docker.sock` mounted read-on
 | `JOB_LABELS` | `org.chrisproject.miniChRIS=plugininstance` | Labels applied to all job containers |
 | `REMOVE_JOBS` | `yes` | Remove containers on DELETE |
 
-### Kafka broker
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KAFKA_ADMIN_PASSWORD` | `admin-secret` | SASL/PLAIN password for the admin super-user |
-
 ### PostgreSQL
 
 | Variable | Default | Description |
@@ -510,13 +516,14 @@ Requires `/var/lib/docker/containers` and `/var/run/docker.sock` mounted read-on
 | `POSTGRES_USER` | `chris` | Database user |
 | `POSTGRES_PASSWORD` | `chris1234` | Database password |
 
-### Production TLS and authentication for Kafka
+### Redis durability and HA
 
-The dev environment uses `SASL_PLAINTEXT` with `SASL/PLAIN` (credentials in cleartext over the wire). For production:
+The `redis:7-alpine` container is launched with `--appendonly yes --appendfsync everysec` everywhere Redis runs (docker-compose, `kubernetes/20-infra/redis.yaml`, and `kubernetes/tests/integration-stack.yaml`). This bounds data loss to roughly one second of writes on an `fsync` gap without the throughput cost of `appendfsync always`.
 
-1. Switch authentication from `SASL/PLAIN` to `SASL/SCRAM-SHA-512` (hashed credentials)
-2. Generate CA, broker, and client certificates
-3. Configure the Kafka broker with `ssl.keystore.location`, `ssl.truststore.location`
-4. Change `KAFKA_SECURITY_PROTOCOL` to `SASL_SSL` and `KAFKA_SASL_MECHANISM` to `SCRAM-SHA-512` on all clients
-5. Distribute client keystores/truststores to each service container
-6. Update Fluent Bit `rdkafka.security.protocol` to `SASL_SSL`, `rdkafka.sasl.mechanism` to `SCRAM-SHA-512`, and add `rdkafka.ssl.ca.location`
+For production HA, apply `kubernetes/20-infra/redis-ha.yaml` instead of (or in addition to) the default single-node manifest. It ships:
+
+- A 3-replica Redis StatefulSet (1 primary + 2 replicas, via an init container that sets `replicaof` for ordinal > 0).
+- A 3-replica Sentinel StatefulSet pointing at the same primary.
+- Sentinel service at `redis-sentinel:26379` with master name `mymaster`.
+
+Workers opt in by switching `REDIS_URL` to `redis+sentinel://redis-sentinel:26379/mymaster/0`; `create_redis_client()` detects the scheme and resolves the master via `redis.asyncio.sentinel.Sentinel`, so no code changes are needed to move between single-node and Sentinel topologies.

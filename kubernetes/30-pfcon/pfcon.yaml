@@ -68,8 +68,8 @@ spec:
             - name: JOB_NAMESPACE
               value: chris-streaming
             # JOB_LABELS is applied raw (no translation) to every pfcon-spawned
-            # pod. We use a K8s-idiomatic role label the streaming workers and
-            # fluent-bit can select on.
+            # pod. We use a K8s-idiomatic domain/key label the streaming workers
+            # select on (vs. Docker's flat org.chrisproject.miniChRIS key).
             - name: JOB_LABELS
               value: "chrisproject.org/role=plugininstance"
             - name: REMOVE_JOBS

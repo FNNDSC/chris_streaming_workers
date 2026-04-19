@@ -132,9 +132,6 @@ _OPTIONAL_STEPS = {"copy", "upload"}
 # Terminal statuses that indicate completion
 _TERMINAL_STATUSES = {"finishedSuccessfully", "finishedWithError", "undefined"}
 
-# Terminal workflow status values (written to job_workflow.status at cleanup time).
-_WORKFLOW_TERMINAL = {"finishedSuccessfully", "finishedWithError", "failed"}
-
 
 def _is_step_required(step: str, params: dict) -> bool:
     """Return True if the given workflow step must be scheduled."""
@@ -588,9 +585,8 @@ def cleanup_containers(self, job_id: str) -> dict:
     are missing, we also accept a bounded quiescence condition: the step's
     terminal status has been recorded in ``job_status`` for at least
     ``EOS_QUIESCENCE_SECONDS``. EOS is therefore a hint, not the sole
-    correctness signal — Kafka does not guarantee EOS ordering across
-    independent producers (Fluent Bit and the Event Forwarder), so we
-    must not block cleanup on it alone.
+    correctness signal — the log shipper and event forwarder are
+    independent producers, so we must not block cleanup on it alone.
     """
     r = _get_redis()
 

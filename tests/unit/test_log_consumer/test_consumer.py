@@ -2,23 +2,28 @@
 
 from unittest.mock import AsyncMock
 
-from chris_streaming.log_consumer.consumer import LogEventConsumer
+import pytest
+
+from chris_streaming.log_consumer.consumer import LogEventConsumer, _PendingEntry
 
 
 class TestLogEventConsumer:
     def _make_consumer(self):
-        mock_kafka = AsyncMock()
+        mock_redis = AsyncMock()
         mock_os = AsyncMock()
         mock_redis_pub = AsyncMock()
         consumer = LogEventConsumer(
-            consumer=mock_kafka,
+            redis=mock_redis,
+            base_stream="stream:job-logs",
+            num_shards=2,
+            group_name="log-consumer-group",
+            consumer_name="test-consumer",
             opensearch=mock_os,
             redis_pub=mock_redis_pub,
-            redis_url="redis://localhost:6379/0",
             batch_max_size=5,
             batch_max_wait_seconds=0.1,
         )
-        return consumer, mock_kafka, mock_os, mock_redis_pub
+        return consumer, mock_redis, mock_os, mock_redis_pub
 
     async def test_flush_writes_to_opensearch_and_redis(self, sample_log_event):
         consumer, _, mock_os, mock_redis_pub = self._make_consumer()
@@ -33,45 +38,106 @@ class TestLogEventConsumer:
         consumer, _, mock_os, mock_redis_pub = self._make_consumer()
         mock_redis_pub.publish_batch = AsyncMock(side_effect=Exception("Redis down"))
 
-        # Should not raise — Redis publish is best-effort
         await consumer._flush([sample_log_event])
         mock_os.write_batch.assert_awaited_once()
 
     async def test_flush_opensearch_failure_raises(self, sample_log_event):
-        consumer, _, mock_os, mock_redis_pub = self._make_consumer()
+        consumer, _, mock_os, _ = self._make_consumer()
         mock_os.write_batch = AsyncMock(side_effect=Exception("OS down"))
 
-        import pytest
         with pytest.raises(Exception, match="OS down"):
             await consumer._flush([sample_log_event])
 
-    async def test_set_logs_flushed(self):
+    async def test_flush_pending_acks_after_success(self, sample_log_event):
+        consumer, mock_redis, mock_os, mock_redis_pub = self._make_consumer()
+        pending = [
+            _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
+            _PendingEntry(stream="stream:job-logs:0", entry_id="2-0", event=sample_log_event),
+        ]
+
+        await consumer._flush_pending(pending)
+
+        mock_os.write_batch.assert_awaited_once()
+        mock_redis_pub.publish_batch.assert_awaited_once()
+        mock_redis.xack.assert_awaited_once_with(
+            "stream:job-logs:0", "log-consumer-group", "1-0", "2-0",
+        )
+
+    async def test_flush_pending_skips_ack_on_opensearch_failure(
+        self, sample_log_event
+    ):
+        consumer, mock_redis, mock_os, _ = self._make_consumer()
+        mock_os.write_batch = AsyncMock(side_effect=Exception("OS down"))
+        pending = [
+            _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
+        ]
+
+        await consumer._flush_pending(pending)
+        # No XACK because the flush failed
+        mock_redis.xack.assert_not_awaited()
+
+    async def test_flush_pending_sets_logs_flushed_on_eos_only_batch(
+        self, eos_log_event
+    ):
+        consumer, mock_redis, mock_os, _ = self._make_consumer()
+        pending = [
+            _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=eos_log_event),
+        ]
+
+        await consumer._flush_pending(pending)
+
+        # No OpenSearch write (no real log lines in batch)
+        mock_os.write_batch.assert_not_awaited()
+        # EOS signals the logs_flushed key for this job/type
+        mock_redis.set.assert_awaited_once_with(
+            f"job:{eos_log_event.job_id}:{eos_log_event.job_type.value}:logs_flushed",
+            "1",
+            ex=3600,
+        )
+        # And is ACK'd so it does not stall the stream
+        mock_redis.xack.assert_awaited_once_with(
+            "stream:job-logs:0", "log-consumer-group", "1-0",
+        )
+
+    async def test_flush_pending_sets_logs_flushed_after_mixed_batch_flush(
+        self, sample_log_event, eos_log_event
+    ):
+        consumer, mock_redis, mock_os, _ = self._make_consumer()
+        pending = [
+            _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
+            _PendingEntry(stream="stream:job-logs:0", entry_id="2-0", event=eos_log_event),
+        ]
+
+        await consumer._flush_pending(pending)
+
+        mock_os.write_batch.assert_awaited_once()
+        mock_redis.set.assert_awaited_once_with(
+            f"job:{eos_log_event.job_id}:{eos_log_event.job_type.value}:logs_flushed",
+            "1",
+            ex=3600,
+        )
+        mock_redis.xack.assert_awaited_once_with(
+            "stream:job-logs:0", "log-consumer-group", "1-0", "2-0",
+        )
+
+    async def test_flush_pending_holds_eos_on_opensearch_failure(
+        self, sample_log_event, eos_log_event
+    ):
+        """If OpenSearch write fails, EOS must NOT fire logs_flushed yet."""
+        consumer, mock_redis, mock_os, _ = self._make_consumer()
+        mock_os.write_batch = AsyncMock(side_effect=Exception("OS down"))
+        pending = [
+            _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
+            _PendingEntry(stream="stream:job-logs:0", entry_id="2-0", event=eos_log_event),
+        ]
+
+        await consumer._flush_pending(pending)
+
+        mock_redis.set.assert_not_awaited()
+        mock_redis.xack.assert_not_awaited()
+
+    async def test_close_stops_loop(self):
         consumer, _, _, _ = self._make_consumer()
-        mock_redis = AsyncMock()
-        consumer._redis = mock_redis
-
-        await consumer._set_logs_flushed("j1", "plugin")
-
-        mock_redis.set.assert_awaited_once()
-        call_args = mock_redis.set.call_args
-        assert call_args[0][0] == "job:j1:plugin:logs_flushed"
-        assert call_args[0][1] == "1"
-        assert call_args[1]["ex"] == 3600
-
-    async def test_set_logs_flushed_error_swallowed(self):
-        consumer, _, _, _ = self._make_consumer()
-        mock_redis = AsyncMock()
-        mock_redis.set = AsyncMock(side_effect=Exception("fail"))
-        consumer._redis = mock_redis
-
-        # Should not raise
-        await consumer._set_logs_flushed("j1", "plugin")
-
-    async def test_close(self):
-        consumer, mock_kafka, _, _ = self._make_consumer()
-        mock_redis = AsyncMock()
-        consumer._redis = mock_redis
-
+        consumer._running = True
         await consumer.close()
-        mock_kafka.stop.assert_awaited_once()
-        mock_redis.close.assert_awaited_once()
+        assert consumer._running is False

@@ -3,9 +3,13 @@ Entry point for the Status Consumer service.
 
     python -m chris_streaming.status_consumer
 
-Reads job-status-events from Kafka, publishes to Redis Pub/Sub for real-time
-delivery, and schedules Celery tasks for DB persistence and terminal status
-confirmation.
+Consumes the sharded ``stream:job-status:{shard}`` Redis Streams via a
+lease-coordinated ShardedConsumer, retries + DLQs via PendingReclaimer,
+and schedules Celery tasks for downstream processing.
+
+Horizontal scaling: run N replicas. Each replica acquires leases on a
+subset of shards via ShardLeaseManager. On replica death, other replicas
+pick up the abandoned shards automatically.
 """
 
 from __future__ import annotations
@@ -16,9 +20,17 @@ import signal
 
 import structlog
 
-from chris_streaming.common.kafka import create_consumer, create_producer
+from chris_streaming.common.redis_stream import (
+    ConsumerConfig,
+    LeaseManagerConfig,
+    PendingReclaimer,
+    ReclaimerConfig,
+    ShardLeaseManager,
+    ShardedConsumer,
+    create_redis_client,
+)
 from chris_streaming.common.settings import StatusConsumerSettings
-from .consumer import StatusEventConsumer
+from .consumer import StatusMessageHandler
 from .notifier import StatusNotifier
 
 logger = structlog.get_logger()
@@ -34,28 +46,61 @@ async def main() -> None:
 
     logger.info(
         "Starting Status Consumer",
-        group=settings.kafka_consumer_group,
-        topic=settings.kafka_topic_status,
+        group=settings.status_consumer_group,
+        stream_base=settings.stream_status_base,
+        num_shards=settings.stream_num_shards,
     )
 
-    # Initialize components
     notifier = StatusNotifier(settings.celery_broker_url)
+    handler = StatusMessageHandler(notifier)
 
-    kafka_consumer = await create_consumer(
-        settings,
-        topic=settings.kafka_topic_status,
-        group_id=settings.kafka_consumer_group,
+    redis = await create_redis_client(settings.redis_url)
+
+    # Lease manager (shard ownership coordination)
+    lease_cfg = LeaseManagerConfig(
+        num_shards=settings.stream_num_shards,
+        lease_key_prefix=f"chris:lease:{settings.status_consumer_group}",
+        lease_ttl_ms=settings.lease_ttl_ms,
+        refresh_interval_ms=settings.lease_refresh_interval_ms,
+        acquire_interval_ms=settings.lease_acquire_interval_ms,
     )
+    leases = ShardLeaseManager(redis, lease_cfg)
 
-    dlq_producer = await create_producer(settings)
-
-    consumer = StatusEventConsumer(
-        consumer=kafka_consumer,
-        notifier=notifier,
-        dlq_producer=dlq_producer,
-        dlq_topic=settings.kafka_topic_status_dlq,
-        max_retries=settings.max_retries,
+    # Sharded consumer (per-shard XREADGROUP tasks)
+    consumer_cfg = ConsumerConfig(
+        base_stream=settings.stream_status_base,
+        num_shards=settings.stream_num_shards,
+        group_name=settings.status_consumer_group,
+        consumer_name=leases.replica_id,
+        dlq_stream=settings.stream_status_dlq,
+        dlq_maxlen_approx=settings.stream_dlq_maxlen,
+        handler_retries=settings.handler_retries,
     )
+    consumer = ShardedConsumer(redis, consumer_cfg, handler=handler)
+
+    # Pending-entries reclaimer (retry + DLQ)
+    reclaim_cfg = ReclaimerConfig(
+        base_stream=settings.stream_status_base,
+        num_shards=settings.stream_num_shards,
+        group_name=settings.status_consumer_group,
+        consumer_name=leases.replica_id,
+        min_idle_ms=settings.reclaim_min_idle_ms,
+        max_deliveries=settings.reclaim_max_deliveries,
+        sweep_interval_ms=settings.reclaim_sweep_interval_ms,
+        dlq_stream=settings.stream_status_dlq,
+        dlq_maxlen_approx=settings.stream_dlq_maxlen,
+    )
+    reclaimer = PendingReclaimer(redis, reclaim_cfg, on_reclaimed=handler.reclaim)
+
+    async def _on_shard_change(added: set[int], removed: set[int]) -> None:
+        await consumer.set_shards(added, removed)
+        reclaimer.set_owned(leases.owned_shards)
+
+    leases.add_listener(_on_shard_change)
+
+    await consumer.start()
+    await leases.start()
+    await reclaimer.start()
 
     # Graceful shutdown
     shutdown_event = asyncio.Event()
@@ -68,18 +113,12 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _shutdown, sig)
 
-    # Run consumer until shutdown
-    consume_task = asyncio.create_task(consumer.run())
-
     await shutdown_event.wait()
-    consume_task.cancel()
 
-    try:
-        await consume_task
-    except asyncio.CancelledError:
-        pass
-
-    await consumer.close()
+    await reclaimer.stop()
+    await leases.stop()
+    await consumer.stop()
+    await redis.close()
     logger.info("Status Consumer stopped")
 
 

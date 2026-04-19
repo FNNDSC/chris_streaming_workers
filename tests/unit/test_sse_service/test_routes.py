@@ -23,6 +23,30 @@ class TestHealthEndpoint:
         assert resp.json() == {"status": "ok"}
 
 
+class TestMetricsEndpoint:
+    async def test_metrics_returns_stream_snapshot(self, app):
+        fake_redis = AsyncMock()
+        fake_redis.close = AsyncMock()
+        snapshot = {
+            "status": {"shards": [{"stream": "s:0", "xlen": 0, "pending": 0}], "dlq_xlen": 0},
+            "logs": {"shards": [{"stream": "l:0", "xlen": 0, "pending": 0}], "dlq_xlen": 0},
+        }
+        with patch(
+            "chris_streaming.sse_service.routes.create_redis_client",
+            AsyncMock(return_value=fake_redis),
+        ), patch(
+            "chris_streaming.sse_service.routes.collect_stream_metrics",
+            AsyncMock(return_value=snapshot),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get("/metrics")
+        assert resp.status_code == 200
+        assert resp.json() == snapshot
+        fake_redis.close.assert_awaited_once()
+
+
 class TestRunWorkflow:
     async def test_run_workflow_returns_202(self, app):
         with patch("chris_streaming.sse_service.routes.celery_app") as mock_celery:

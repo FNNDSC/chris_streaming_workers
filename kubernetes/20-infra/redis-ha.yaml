@@ -1,0 +1,180 @@
+---
+# Optional Redis HA topology: 1 primary + 2 replicas + 3 Sentinels.
+#
+# NOT included in kustomization.yaml by default — opt in by adding
+# `- 20-infra/redis-ha.yaml` (and removing `- 20-infra/redis.yaml`) in the
+# root kustomization, then set REDIS_URL on all workers to:
+#
+#     redis+sentinel://redis-sentinel:26379/mymaster/0
+#
+# create_redis_client() will route through sentinels and follow failover.
+#
+# Services exposed:
+#   - redis-ha           — StatefulSet headless service (redis-ha-0/1/2)
+#   - redis-sentinel     — Sentinel pool (3 replicas)
+#
+# The old single-instance Service "redis" is preserved as an alias that
+# round-robins to all replicas — do NOT use it for writes; use the
+# sentinel URL instead.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-ha-config
+  namespace: chris-streaming
+  labels:
+    app: redis-ha
+data:
+  redis.conf: |
+    appendonly yes
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    # Replicas discover the primary via the init container.
+    replica-read-only yes
+    replica-serve-stale-data yes
+  sentinel.conf.template: |
+    port 26379
+    sentinel monitor mymaster redis-ha-0.redis-ha 6379 2
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 10000
+    sentinel parallel-syncs mymaster 1
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-ha
+  namespace: chris-streaming
+  labels:
+    app: redis-ha
+spec:
+  clusterIP: None
+  selector:
+    app: redis-ha
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-ha
+  namespace: chris-streaming
+  labels:
+    app: redis-ha
+spec:
+  serviceName: redis-ha
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis-ha
+  template:
+    metadata:
+      labels:
+        app: redis-ha
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              ORDINAL="${HOSTNAME##*-}"
+              cp /etc/redis/redis.conf /tmp/redis.conf
+              if [ "$ORDINAL" != "0" ]; then
+                echo "replicaof redis-ha-0.redis-ha 6379" >> /tmp/redis.conf
+              fi
+              exec redis-server /tmp/redis.conf
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 20
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: redis-ha-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-sentinel
+  namespace: chris-streaming
+  labels:
+    app: redis-sentinel
+spec:
+  selector:
+    app: redis-sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+      targetPort: 26379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis-sentinel
+  namespace: chris-streaming
+  labels:
+    app: redis-sentinel
+spec:
+  serviceName: redis-sentinel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis-sentinel
+  template:
+    metadata:
+      labels:
+        app: redis-sentinel
+    spec:
+      containers:
+        - name: sentinel
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              cp /etc/redis/sentinel.conf.template /tmp/sentinel.conf
+              exec redis-sentinel /tmp/sentinel.conf
+          ports:
+            - containerPort: 26379
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-p", "26379", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: redis-ha-config

@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from chris_streaming.common.settings import SSEServiceSettings
+from chris_streaming.common.redis_stream import create_redis_client
+from chris_streaming.common.stream_metrics import collect_stream_metrics
 from .redis_subscriber import subscribe_to_job
 from .tasks import celery_app
 
@@ -208,3 +210,23 @@ def _query_workflow(db_dsn: str, job_id: str) -> Optional[dict]:
 @router.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@router.get("/metrics")
+async def metrics():
+    """Stream depth / PEL / DLQ snapshot for both pipelines."""
+    settings = _get_settings()
+    redis = await create_redis_client(settings.redis_url)
+    try:
+        return await collect_stream_metrics(
+            redis,
+            status_base=settings.stream_status_base,
+            status_dlq=settings.stream_status_dlq,
+            status_group=settings.status_consumer_group,
+            logs_base=settings.stream_logs_base,
+            logs_dlq=settings.stream_logs_dlq,
+            logs_group=settings.log_consumer_group,
+            num_shards=settings.stream_num_shards,
+        )
+    finally:
+        await redis.close()

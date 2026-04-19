@@ -1,9 +1,14 @@
 # Kubernetes deployment
 
 This directory contains Kubernetes manifests that bring up the same stack
-`docker-compose.yml` defines (Kafka + OpenSearch + Redis + PostgreSQL + Fluent
-Bit + pfcon + streaming workers + SSE + test UI) on a local Kubernetes
-cluster. Tested on Docker Desktop's built-in K8s.
+`docker-compose.yml` defines (Redis + OpenSearch + PostgreSQL + pfcon +
+streaming workers + SSE + test UI) on a local Kubernetes cluster. Tested on
+Docker Desktop's built-in K8s.
+
+Transport for both job-status events and container log lines is Redis Streams
+(sharded, with consumer groups, PEL, and DLQ). The Log Forwarder worker
+replaces Fluent Bit — it watches Pods via the K8s API and streams logs with
+`read_namespaced_pod_log(follow=True)` directly into the log-stream shards.
 
 The top-level `justfile` provides `just k8s-*` recipes that mirror the
 docker-compose workflow. All commands are idempotent and safe to re-run.
@@ -105,9 +110,29 @@ identify copy/plugin/upload/delete steps.
 
 - `chris-streaming` — the application itself. pfcon schedules plugininstance
   Jobs here too (`JOB_NAMESPACE=chris-streaming`) so the event forwarder and
-  Fluent Bit can watch/read them.
+  log forwarder can watch/read them.
 - `chris-streaming-test` — ephemeral integration infra + test Jobs. Created
   and destroyed per `just k8s-run` invocation so test state never leaks.
+
+## Redis topology
+
+`kubernetes/20-infra/redis.yaml` runs a single Redis StatefulSet with
+`--appendonly yes --appendfsync everysec`. `redis-ha.yaml` is opt-in: a
+primary + 2 replicas + 3 Sentinels for failover. To switch the workers
+onto the HA topology, apply `redis-ha.yaml` and update their `REDIS_URL`
+env to a `redis+sentinel://` URL pointing at the Sentinel service.
+
+All four workers share the same stream topology via env:
+
+- `stream:job-status:{0..N}` — status events (Event Forwarder → Status
+  Consumer → Celery task → PostgreSQL + Pub/Sub).
+- `stream:job-logs:{0..N}` — container log lines (Log Forwarder → Log
+  Consumer → OpenSearch + Pub/Sub), plus `eos=true` markers on each
+  container's final log entry.
+
+Shard count, consumer group names, batch sizes, and reclaim/lease TTLs
+are read from env at pod startup — see the main [README.md](../README.md)
+for the full configuration reference.
 
 ## Resilience notes
 

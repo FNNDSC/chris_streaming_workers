@@ -20,25 +20,21 @@ spec:
     spec:
       containers:
         - name: log-consumer
-          image: localhost:5005/fnndsc/compute-logs-consumer:dev
+          image: localhost:5005/fnndsc/compute-log-consumer:dev
           imagePullPolicy: Always
           env:
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:9092
-            - name: KAFKA_SECURITY_PROTOCOL
-              value: SASL_PLAINTEXT
-            - name: KAFKA_SASL_MECHANISM
-              value: PLAIN
-            - name: KAFKA_SASL_USERNAME
-              value: log-consumer
-            - name: KAFKA_SASL_PASSWORD
-              value: log-consumer-secret
-            - name: KAFKA_CONSUMER_GROUP
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: STREAM_LOGS_BASE
+              value: stream:job-logs
+            - name: STREAM_LOGS_DLQ
+              value: stream:job-logs-dlq
+            - name: STREAM_NUM_SHARDS
+              value: "8"
+            - name: LOG_CONSUMER_GROUP
               value: log-consumer-group
             - name: OPENSEARCH_URL
               value: http://opensearch:9200
-            - name: REDIS_URL
-              value: redis://redis:6379/0
             - name: BATCH_MAX_SIZE
               value: "200"
             - name: BATCH_MAX_WAIT_SECONDS

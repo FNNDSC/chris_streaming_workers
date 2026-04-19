@@ -30,15 +30,11 @@ spec:
               value: chris-streaming
             - name: K8S_LABEL_SELECTOR
               value: "chrisproject.org/role=plugininstance"
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:9092
-            - name: KAFKA_SECURITY_PROTOCOL
-              value: SASL_PLAINTEXT
-            - name: KAFKA_SASL_MECHANISM
-              value: PLAIN
-            - name: KAFKA_SASL_USERNAME
-              value: event-forwarder
-            - name: KAFKA_SASL_PASSWORD
-              value: event-forwarder-secret
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: STREAM_STATUS_BASE
+              value: stream:job-status
+            - name: STREAM_NUM_SHARDS
+              value: "8"
             - name: EMIT_INITIAL_STATE
               value: "true"

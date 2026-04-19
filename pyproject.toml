@@ -11,23 +11,25 @@ dependencies = [
 
 [project.optional-dependencies]
 event-forwarder = [
-    "aiokafka>=0.11,<1",
-    "cramjam>=2.8,<3",
+    "redis[hiredis]>=5.2,<6",
     "aiodocker>=0.23,<1",
     "kubernetes-asyncio>=31,<33",
     "structlog>=24.4,<26",
 ]
 status-consumer = [
-    "aiokafka>=0.11,<1",
-    "cramjam>=2.8,<3",
+    "redis[hiredis]>=5.2,<6",
     "celery[redis]>=5.4,<6",
     "structlog>=24.4,<26",
 ]
 log-consumer = [
-    "aiokafka>=0.11,<1",
-    "cramjam>=2.8,<3",
-    "opensearch-py[async]>=2.7,<3",
     "redis[hiredis]>=5.2,<6",
+    "opensearch-py[async]>=2.7,<3",
+    "structlog>=24.4,<26",
+]
+log-forwarder = [
+    "redis[hiredis]>=5.2,<6",
+    "aiodocker>=0.23,<1",
+    "kubernetes-asyncio>=31,<33",
     "structlog>=24.4,<26",
 ]
 sse-service = [
@@ -41,7 +43,7 @@ sse-service = [
     "requests>=2.31,<3",
 ]
 all = [
-    "chris-streaming-workers[event-forwarder,status-consumer,log-consumer,sse-service]",
+    "chris-streaming-workers[event-forwarder,status-consumer,log-consumer,log-forwarder,sse-service]",
 ]
 dev = [
     "pytest>=8,<9",
@@ -49,6 +51,7 @@ dev = [
     "pytest-mock>=3.14,<4",
     "httpx>=0.27,<1",
     "respx>=0.22,<1",
+    "fakeredis>=2.26,<3",
     "ruff>=0.8,<1",
 ]
 

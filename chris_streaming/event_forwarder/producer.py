@@ -1,10 +1,10 @@
 """
-Kafka producer for status events with deduplication.
+Redis Streams producer for status events with deduplication.
 
-Wraps the shared Kafka producer factory with event-specific logic:
+Wraps the shared RedisStreamProducer with event-specific logic:
   - Deterministic event_id for consumer-side dedup
-  - Kafka key = job_id for partition ordering
-  - Idempotent producer (network-level exactly-once)
+  - Shard routing by job_id (producer side of per-job ordering)
+  - In-memory LRU cache as a best-effort producer-side dedup
 """
 
 from __future__ import annotations
@@ -12,9 +12,8 @@ from __future__ import annotations
 import logging
 from collections import OrderedDict
 
-from aiokafka import AIOKafkaProducer
-
-from chris_streaming.common.schemas import StatusEvent, kafka_key_for_job
+from chris_streaming.common.redis_stream import RedisStreamProducer
+from chris_streaming.common.schemas import StatusEvent
 
 logger = logging.getLogger(__name__)
 
@@ -23,34 +22,33 @@ _DEDUP_CACHE_SIZE = 10_000
 
 
 class StatusEventProducer:
-    """Produces StatusEvent messages to the job-status-events Kafka topic."""
+    """Produces StatusEvent messages to the job-status Redis Stream."""
 
-    def __init__(self, producer: AIOKafkaProducer, topic: str):
+    def __init__(self, producer: RedisStreamProducer):
         self._producer = producer
-        self._topic = topic
         self._seen: OrderedDict[str, None] = OrderedDict()
 
     async def send(self, event: StatusEvent) -> bool:
         """
-        Send a status event to Kafka. Returns False if deduplicated (already sent).
+        Send a status event to the Redis Stream. Returns False if
+        deduplicated (already sent in this process' lifetime).
 
-        Deduplication is best-effort (in-memory LRU). The consumer should also
-        handle duplicates idempotently via upsert semantics.
+        Dedup is best-effort (in-memory LRU). The consumer handler path
+        handles duplicates idempotently via the Postgres upsert's
+        ``WHERE updated_at < EXCLUDED.updated_at`` guard.
         """
         if event.event_id in self._seen:
-            logger.debug("Dedup: skipping event %s for job %s", event.event_id, event.job_id)
+            logger.debug("Dedup: skipping event %s for job %s",
+                         event.event_id, event.job_id)
             return False
 
-        key = kafka_key_for_job(event.job_id)
-        value = event.serialize_for_kafka()
-
-        await self._producer.send_and_wait(self._topic, value=value, key=key)
+        value = event.serialize()
+        entry_id = await self._producer.xadd(event.job_id, value)
         logger.info(
-            "Produced status event: job=%s type=%s status=%s",
-            event.job_id, event.job_type.value, event.status.value,
+            "Produced status event: job=%s type=%s status=%s entry=%s",
+            event.job_id, event.job_type.value, event.status.value, entry_id,
         )
 
-        # Track in LRU
         self._seen[event.event_id] = None
         if len(self._seen) > _DEDUP_CACHE_SIZE:
             self._seen.popitem(last=False)
@@ -58,4 +56,5 @@ class StatusEventProducer:
         return True
 
     async def close(self) -> None:
-        await self._producer.stop()
+        # Producer is owned by the caller (event_forwarder/__main__).
+        pass

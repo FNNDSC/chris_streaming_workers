@@ -23,19 +23,17 @@ spec:
           image: localhost:5005/fnndsc/compute-status-consumer:dev
           imagePullPolicy: Always
           env:
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:9092
-            - name: KAFKA_SECURITY_PROTOCOL
-              value: SASL_PLAINTEXT
-            - name: KAFKA_SASL_MECHANISM
-              value: PLAIN
-            - name: KAFKA_SASL_USERNAME
-              value: status-consumer
-            - name: KAFKA_SASL_PASSWORD
-              value: status-consumer-secret
-            - name: KAFKA_CONSUMER_GROUP
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: STREAM_STATUS_BASE
+              value: stream:job-status
+            - name: STREAM_STATUS_DLQ
+              value: stream:job-status-dlq
+            - name: STREAM_NUM_SHARDS
+              value: "8"
+            - name: STATUS_CONSUMER_GROUP
               value: status-consumer-group
             - name: CELERY_BROKER_URL
               value: redis://redis:6379/0
-            - name: MAX_RETRIES
+            - name: HANDLER_RETRIES
               value: "3"

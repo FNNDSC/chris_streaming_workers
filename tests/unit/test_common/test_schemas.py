@@ -9,7 +9,6 @@ from chris_streaming.common.schemas import (
     JobType,
     LogEvent,
     StatusEvent,
-    kafka_key_for_job,
 )
 
 
@@ -81,9 +80,9 @@ class TestStatusEvent:
         assert event.event_id == "custom123"
 
     def test_serialize_deserialize_roundtrip(self, sample_status_event):
-        data = sample_status_event.serialize_for_kafka()
+        data = sample_status_event.serialize()
         assert isinstance(data, bytes)
-        restored = StatusEvent.deserialize_from_kafka(data)
+        restored = StatusEvent.deserialize(data)
         assert restored.job_id == sample_status_event.job_id
         assert restored.job_type == sample_status_event.job_type
         assert restored.status == sample_status_event.status
@@ -91,14 +90,14 @@ class TestStatusEvent:
         assert restored.event_id == sample_status_event.event_id
 
     def test_serialize_produces_valid_json(self, sample_status_event):
-        data = sample_status_event.serialize_for_kafka()
+        data = sample_status_event.serialize()
         parsed = json.loads(data)
         assert parsed["job_id"] == "test-job-1"
         assert parsed["status"] == "started"
         assert parsed["job_type"] == "plugin"
 
     def test_timestamp_serialized_as_iso(self, sample_status_event):
-        data = json.loads(sample_status_event.serialize_for_kafka())
+        data = json.loads(sample_status_event.serialize())
         assert "2026-01-15" in data["timestamp"]
 
     def test_default_values(self):
@@ -126,17 +125,17 @@ class TestStatusEvent:
 
 class TestLogEvent:
     def test_serialize_deserialize_roundtrip(self, sample_log_event):
-        data = sample_log_event.serialize_for_kafka()
+        data = sample_log_event.serialize()
         assert isinstance(data, bytes)
-        restored = LogEvent.deserialize_from_kafka(data)
+        restored = LogEvent.deserialize(data)
         assert restored.job_id == sample_log_event.job_id
         assert restored.line == sample_log_event.line
         assert restored.eos is False
 
     def test_eos_marker(self, eos_log_event):
         assert eos_log_event.eos is True
-        data = eos_log_event.serialize_for_kafka()
-        restored = LogEvent.deserialize_from_kafka(data)
+        data = eos_log_event.serialize()
+        restored = LogEvent.deserialize(data)
         assert restored.eos is True
         assert restored.line == ""
 
@@ -209,17 +208,7 @@ class TestLogEvent:
             line="hello",
             timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
         )
-        restored = LogEvent.deserialize_from_kafka(original.serialize_for_kafka())
+        restored = LogEvent.deserialize(original.serialize())
         assert restored.event_id == original.event_id
 
 
-# ── kafka_key_for_job ─────────────────────────────────────────────────────
-
-class TestKafkaKeyForJob:
-    def test_returns_bytes(self):
-        key = kafka_key_for_job("test-job-1")
-        assert isinstance(key, bytes)
-        assert key == b"test-job-1"
-
-    def test_different_jobs_different_keys(self):
-        assert kafka_key_for_job("a") != kafka_key_for_job("b")

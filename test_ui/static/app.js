@@ -112,15 +112,38 @@ function connectSSE() {
     logSource.addEventListener('logs', (e) => {
         try {
             const data = JSON.parse(e.data);
-            const streamClass = data.stream === 'stderr' ? 'stream-stderr' : '';
+            const severity = detectSeverity(data.line);
+            const sevClass = severity ? `sev-${severity}` : '';
             appendLog(
                 `<span class="log-line">` +
                 `<span class="ts">[${data.timestamp?.substring(11, 23) || ''}]</span> ` +
-                `<span class="${streamClass}">${escapeHtml(data.line)}</span>` +
+                `<span class="${sevClass}">${escapeHtml(data.line)}</span>` +
                 `</span>`
             );
         } catch { appendLog(`<span class="log-line">${escapeHtml(e.data)}</span>`); }
     });
+}
+
+// Classify a log line's severity from its content. Returns 'error', 'warn',
+// or null. We rely on content — not the stream the line came from — because
+// Python's `logging` module (used by pfcon's copy/upload/delete workers)
+// writes every level to stderr by default, making stderr-as-error misleading.
+function detectSeverity(line) {
+    if (!line) return null;
+    // Bracketed level tokens: pfcon format "[%(levelname)s]", also Celery/Flask/etc.
+    if (/\[(ERROR|CRITICAL|FATAL)\]/i.test(line)) return 'error';
+    if (/\[(WARN|WARNING)\]/i.test(line)) return 'warn';
+    // Python traceback header.
+    if (/^Traceback \(most recent call last\):/.test(line)) return 'error';
+    // Final line of a traceback: "ValueError: ...", "ZeroDivisionError: ...", etc.
+    // Plugins rarely use a logging framework, so this is often the only signal
+    // we get that something went wrong.
+    if (/^[A-Z]\w*(?:Error|Exception):/.test(line)) return 'error';
+    if (/^[A-Z]\w*Warning:/.test(line)) return 'warn';
+    // Leading level tokens: "ERROR:", "WARNING ", etc. (common in plugin stdout).
+    if (/^\s*(ERROR|CRITICAL|FATAL)[\s:]/.test(line)) return 'error';
+    if (/^\s*(WARN|WARNING)[\s:]/.test(line)) return 'warn';
+    return null;
 }
 
 function disconnectSSE() {

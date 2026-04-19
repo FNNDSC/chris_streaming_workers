@@ -98,7 +98,8 @@ k8s-build: k8s-registry
     }
     build Dockerfile.event_forwarder compute-event-forwarder
     build Dockerfile.status_consumer compute-status-consumer
-    build Dockerfile.log_consumer    compute-logs-consumer
+    build Dockerfile.log_consumer    compute-log-consumer
+    build Dockerfile.log_forwarder   compute-log-forwarder
     build Dockerfile.sse_service     sse_service
     build Dockerfile.test            chris_streaming_tests
     docker build -t "{{ registry_image_prefix }}/test_ui:dev" ./test_ui
@@ -111,13 +112,11 @@ k8s-up: k8s-build
     kubectl kustomize --load-restrictor=LoadRestrictionsNone kubernetes/ | kubectl apply -f -
     echo "Waiting for pfcon storebase test data..."
     kubectl wait --for=condition=complete job/init-test-data -n {{ k8s_ns }} --timeout=120s || true
-    echo "Waiting for kafka-init..."
-    kubectl wait --for=condition=complete job/kafka-init -n {{ k8s_ns }} --timeout=180s || true
     echo "Waiting for deployments..."
-    for dep in pfcon sse-service celery-worker event-forwarder status-consumer log-consumer redis test-ui; do
+    for dep in pfcon sse-service celery-worker event-forwarder status-consumer log-consumer log-forwarder redis test-ui; do
         kubectl rollout status deployment/$dep -n {{ k8s_ns }} --timeout=180s
     done
-    for sts in kafka opensearch postgres; do
+    for sts in opensearch postgres; do
         kubectl rollout status statefulset/$sts -n {{ k8s_ns }} --timeout=180s
     done
     echo
@@ -189,11 +188,9 @@ k8s-run target="unit-tests":
         just k8s-build
         kubectl kustomize --load-restrictor=LoadRestrictionsNone kubernetes/tests/ | kubectl apply -f -
         echo "Waiting for integration stack..."
-        kubectl wait --for=condition=complete job/kafka-init -n {{ k8s_test_ns }} --timeout=300s
         for dep in redis opensearch postgres; do
             kubectl rollout status deployment/$dep -n {{ k8s_test_ns }} --timeout=180s
         done
-        kubectl rollout status statefulset/kafka -n {{ k8s_test_ns }} --timeout=180s
         run_job {{ k8s_test_ns }} kubernetes/tests/integration-tests-job.yaml integration-tests 900s
         rc=$?
         kubectl kustomize --load-restrictor=LoadRestrictionsNone kubernetes/tests/ | kubectl delete --ignore-not-found=true -f - || true

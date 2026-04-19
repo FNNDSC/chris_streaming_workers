@@ -21,16 +21,6 @@ spec:
           imagePullPolicy: Always
           args: ["-v", "--tb=short", "-m", "integration", "tests/"]
           env:
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: kafka:9092
-            - name: KAFKA_SECURITY_PROTOCOL
-              value: SASL_PLAINTEXT
-            - name: KAFKA_SASL_MECHANISM
-              value: PLAIN
-            - name: KAFKA_SASL_USERNAME
-              value: admin
-            - name: KAFKA_SASL_PASSWORD
-              value: admin-secret
             - name: REDIS_URL
               value: redis://redis:6379/0
             - name: OPENSEARCH_URL

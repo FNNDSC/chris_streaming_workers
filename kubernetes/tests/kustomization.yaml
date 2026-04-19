@@ -7,17 +7,5 @@ resources:
   - 00-test-namespace.yaml
   - integration-stack.yaml
 
-configMapGenerator:
-  - name: kafka-config
-    namespace: chris-streaming-test
-    files:
-      - ../../config/kafka/server.properties
-      - ../../config/kafka/admin.properties
-      - ../../config/kafka/kafka_server_jaas.conf
-  - name: kafka-init-script
-    namespace: chris-streaming-test
-    files:
-      - ../../config/kafka/init-kafka.sh
-
 generatorOptions:
   disableNameSuffixHash: true

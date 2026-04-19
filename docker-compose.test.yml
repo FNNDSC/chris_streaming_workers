@@ -5,7 +5,7 @@
 #   Unit tests (no infra):
 #     docker compose -f docker-compose.test.yml run --rm unit-tests
 #
-#   Integration tests (Kafka, Redis, OpenSearch, PostgreSQL):
+#   Integration tests (Redis, OpenSearch, PostgreSQL):
 #     docker compose -f docker-compose.test.yml --profile integration up -d --wait
 #     docker compose -f docker-compose.test.yml run --rm integration-tests
 #     docker compose -f docker-compose.test.yml --profile integration down
@@ -33,17 +33,10 @@ services:
     profiles: ["integration"]
     command: ["-v", "--tb=short", "-m", "integration", "tests/"]
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
-      KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_SASL_USERNAME: admin
-      KAFKA_SASL_PASSWORD: admin-secret
       REDIS_URL: redis://redis:6379/0
       OPENSEARCH_URL: http://opensearch:9200
       DB_DSN: postgresql://chris:chris1234@postgres:5432/chris_streaming_test
     depends_on:
-      kafka-init:
-        condition: service_completed_successfully
       redis:
         condition: service_healthy
       opensearch:
@@ -70,51 +63,15 @@ services:
 
   # ── Infrastructure (integration profile) ──────────────────────────────────
 
-  kafka:
-    image: apache/kafka:3.9.0
-    hostname: kafka
-    profiles: ["integration"]
-    environment:
-      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/jaas/kafka_server_jaas.conf"
-      CLUSTER_ID: "chris-test-cluster-001"
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        /opt/kafka/bin/kafka-storage.sh format \
-          --config /opt/kafka/config/server.properties \
-          --cluster-id "$$CLUSTER_ID" \
-          --ignore-formatted
-        exec /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
-    volumes:
-      - ./config/kafka/server.properties:/opt/kafka/config/server.properties:ro
-      - ./config/kafka/admin.properties:/etc/kafka/admin.properties:ro
-      - ./config/kafka/kafka_server_jaas.conf:/etc/kafka/jaas/kafka_server_jaas.conf:ro
-    networks:
-      - test
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /etc/kafka/admin.properties > /dev/null 2>&1 || exit 1"]
-      interval: 5s
-      timeout: 10s
-      retries: 20
-      start_period: 20s
-
-  kafka-init:
-    image: apache/kafka:3.9.0
-    profiles: ["integration"]
-    depends_on:
-      kafka:
-        condition: service_healthy
-    volumes:
-      - ./config/kafka/init-kafka.sh:/init-kafka.sh:ro
-      - ./config/kafka/admin.properties:/etc/kafka/admin.properties:ro
-    entrypoint: ["bash", "/init-kafka.sh"]
-    networks:
-      - test
-    restart: "no"
-
   redis:
     image: redis:7-alpine
     profiles: ["integration"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
     networks:
       - test
     healthcheck:

@@ -99,8 +99,10 @@ jobs:
             dockerfile: ./Dockerfile.event_forwarder
           - image: compute-status-consumer
             dockerfile: ./Dockerfile.status_consumer
-          - image: compute-logs-consumer
+          - image: compute-log-consumer
             dockerfile: ./Dockerfile.log_consumer
+          - image: compute-log-forwarder
+            dockerfile: ./Dockerfile.log_forwarder
     steps:
       - name: Checkout
         uses: actions/checkout@v4

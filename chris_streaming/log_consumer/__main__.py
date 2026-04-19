@@ -3,25 +3,32 @@ Entry point for the Log Consumer service.
 
     python -m chris_streaming.log_consumer
 
-Reads job-logs from Kafka in batches, writes to OpenSearch, and publishes
-to Redis Pub/Sub for real-time streaming.
+Reads log events from the sharded ``stream:job-logs:{shard}`` Redis Streams,
+batches them, writes to OpenSearch, and publishes to Redis Pub/Sub for
+real-time streaming.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import socket
 
 import structlog
 
-from chris_streaming.common.kafka import create_consumer
+from chris_streaming.common.redis_stream import create_redis_client
 from chris_streaming.common.settings import LogConsumerSettings
 from .consumer import LogEventConsumer
 from .opensearch_writer import OpenSearchWriter
 from .redis_publisher import LogRedisPublisher
 
 logger = structlog.get_logger()
+
+
+def _consumer_name() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
 
 
 async def main() -> None:
@@ -34,33 +41,35 @@ async def main() -> None:
 
     logger.info(
         "Starting Log Consumer",
-        group=settings.kafka_consumer_group,
-        topic=settings.kafka_topic_logs,
+        group=settings.log_consumer_group,
+        stream_base=settings.stream_logs_base,
+        num_shards=settings.stream_num_shards,
     )
 
-    # Initialize components
-    opensearch = OpenSearchWriter(settings.opensearch_url, settings.opensearch_index_prefix)
+    # OpenSearch writer
+    opensearch = OpenSearchWriter(
+        settings.opensearch_url, settings.opensearch_index_prefix,
+    )
     await opensearch.connect()
 
+    # Redis Pub/Sub publisher (real-time fan-out)
     redis_pub = LogRedisPublisher(settings.redis_url)
     await redis_pub.connect()
 
-    kafka_consumer = await create_consumer(
-        settings,
-        topic=settings.kafka_topic_logs,
-        group_id=settings.kafka_consumer_group,
-        max_poll_records=settings.batch_max_size,
-    )
+    # Redis client for Streams (decode_responses=False for binary payloads)
+    redis = await create_redis_client(settings.redis_url)
 
     consumer = LogEventConsumer(
-        consumer=kafka_consumer,
+        redis=redis,
+        base_stream=settings.stream_logs_base,
+        num_shards=settings.stream_num_shards,
+        group_name=settings.log_consumer_group,
+        consumer_name=_consumer_name(),
         opensearch=opensearch,
         redis_pub=redis_pub,
-        redis_url=settings.redis_url,
         batch_max_size=settings.batch_max_size,
         batch_max_wait_seconds=settings.batch_max_wait_seconds,
     )
-    await consumer.connect_redis()
 
     # Graceful shutdown
     shutdown_event = asyncio.Event()
@@ -75,6 +84,7 @@ async def main() -> None:
 
     consume_task = asyncio.create_task(consumer.run())
     await shutdown_event.wait()
+    await consumer.stop()
     consume_task.cancel()
 
     try:
@@ -82,9 +92,9 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
 
-    await consumer.close()
     await redis_pub.close()
     await opensearch.close()
+    await redis.close()
     logger.info("Log Consumer stopped")
 
 

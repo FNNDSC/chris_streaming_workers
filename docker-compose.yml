@@ -2,16 +2,16 @@
 # ChRIS Streaming Workers — Docker Compose
 #
 # Includes:
-#   Infrastructure:  Kafka (KRaft, SASL/PLAIN), OpenSearch, Redis, PostgreSQL, Fluent Bit
-#   Custom services: Event Forwarder, Status Consumer, Log Consumer, SSE Service
+#   Infrastructure:  Redis (Streams + Pub/Sub + Celery broker, AOF enabled),
+#                    OpenSearch, PostgreSQL
+#   Custom services: Event Forwarder, Status Consumer, Log Consumer,
+#                    Log Forwarder, SSE Service, Celery Worker
 #   Existing:        pfcon (ghcr.io/fnndsc/pfcon:latest)
 #   Testing:         Test UI, test data init container
 #
 # Usage:
 #   docker compose up --build
 #   Open http://localhost:8888 for the test UI
-#
-# For production TLS on Kafka, see config/kafka/README-tls.md
 # ============================================================================
 
 services:
@@ -19,53 +19,6 @@ services:
   # ==========================================================================
   # INFRASTRUCTURE
   # ==========================================================================
-
-  # ---------- Kafka (KRaft mode, single broker, SASL/PLAIN) -----------------
-  kafka:
-    image: apache/kafka:3.9.0
-    hostname: kafka
-    environment:
-      KAFKA_OPTS: "-Djava.security.auth.login.config=/etc/kafka/jaas/kafka_server_jaas.conf"
-      CLUSTER_ID: "chris-streaming-dev-001"
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        # Format storage if not already formatted
-        /opt/kafka/bin/kafka-storage.sh format \
-          --config /opt/kafka/config/server.properties \
-          --cluster-id "$$CLUSTER_ID" \
-          --ignore-formatted
-        # Start the broker
-        exec /opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties
-    volumes:
-      - kafka_data:/var/lib/kafka/data
-      - ./config/kafka/server.properties:/opt/kafka/config/server.properties:ro
-      - ./config/kafka/admin.properties:/etc/kafka/admin.properties:ro
-      - ./config/kafka/kafka_server_jaas.conf:/etc/kafka/jaas/kafka_server_jaas.conf:ro
-    ports:
-      - "9092:9092"
-    networks:
-      - streaming
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config /etc/kafka/admin.properties > /dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-
-  # Kafka init: create topics and ACLs (runs once)
-  kafka-init:
-    image: apache/kafka:3.9.0
-    depends_on:
-      kafka:
-        condition: service_healthy
-    volumes:
-      - ./config/kafka/init-kafka.sh:/init-kafka.sh:ro
-      - ./config/kafka/admin.properties:/etc/kafka/admin.properties:ro
-    entrypoint: ["bash", "/init-kafka.sh"]
-    networks:
-      - streaming
-    restart: "no"
 
   # ---------- OpenSearch (single-node, security disabled for dev) ----------
   opensearch:
@@ -87,9 +40,19 @@ services:
       retries: 10
       start_period: 30s
 
-  # ---------- Redis (Pub/Sub + Celery broker) ----------
+  # ---------- Redis (Streams + Pub/Sub + Celery broker) ----------
   redis:
     image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
     ports:
       - "6379:6379"
     volumes:
@@ -121,23 +84,23 @@ services:
       timeout: 3s
       retries: 5
 
-  # ---------- Fluent Bit (Docker log agent -> Kafka job-logs) ----------
-  fluent-bit:
-    image: fluent/fluent-bit:3.2
-    volumes:
-      - ./config/fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
-      - ./config/fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
-      - ./config/fluent-bit/enrich.lua:/fluent-bit/etc/enrich.lua:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
-      - fluent_bit_db:/fluent-bit/db
+  # ---------- Log Forwarder (Docker log tailer -> Redis Streams job-logs) ----------
+  log-forwarder:
+    build:
+      context: .
+      dockerfile: Dockerfile.log_forwarder
+    image: localhost/fnndsc/compute-log-forwarder
     environment:
-      KAFKA_BROKERS: kafka:9092
-      KAFKA_SASL_USERNAME: log-producer
-      KAFKA_SASL_PASSWORD: ${LOG_PRODUCER_PASSWORD:-log-producer-secret}
+      REDIS_URL: redis://redis:6379/0
+      STREAM_LOGS_BASE: stream:job-logs
+      STREAM_NUM_SHARDS: "8"
+      DOCKER_LABEL_FILTER: org.chrisproject.miniChRIS
+      DOCKER_LABEL_VALUE: plugininstance
+    volumes:
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
     depends_on:
-      kafka-init:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     networks:
       - streaming
     restart: unless-stopped
@@ -194,7 +157,7 @@ services:
   # CUSTOM STREAMING SERVICES
   # ==========================================================================
 
-  # ---------- Event Forwarder (Docker events -> Kafka job-status-events) -----
+  # ---------- Event Forwarder (Docker events -> Redis Stream job-status) -----
   event-forwarder:
     build:
       context: .
@@ -204,63 +167,56 @@ services:
       COMPUTE_ENV: docker
       DOCKER_LABEL_FILTER: org.chrisproject.miniChRIS
       DOCKER_LABEL_VALUE: plugininstance
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
-      KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_SASL_USERNAME: event-forwarder
-      KAFKA_SASL_PASSWORD: ${EVENT_FORWARDER_PASSWORD:-event-forwarder-secret}
+      REDIS_URL: redis://redis:6379/0
+      STREAM_STATUS_BASE: stream:job-status
+      STREAM_NUM_SHARDS: "8"
       EMIT_INITIAL_STATE: "true"
     volumes:
       - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
     depends_on:
-      kafka-init:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     networks:
       - streaming
     restart: unless-stopped
 
-  # ---------- Status Consumer (Kafka -> Celery) ----------
+  # ---------- Status Consumer (Redis Stream -> Celery) ----------
   status-consumer:
     build:
       context: .
       dockerfile: Dockerfile.status_consumer
     image: localhost/fnndsc/compute-status-consumer
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
-      KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_SASL_USERNAME: status-consumer
-      KAFKA_SASL_PASSWORD: ${STATUS_CONSUMER_PASSWORD:-status-consumer-secret}
-      KAFKA_CONSUMER_GROUP: status-consumer-group
+      REDIS_URL: redis://redis:6379/0
+      STREAM_STATUS_BASE: stream:job-status
+      STREAM_STATUS_DLQ: stream:job-status-dlq
+      STREAM_NUM_SHARDS: "8"
+      STATUS_CONSUMER_GROUP: status-consumer-group
       CELERY_BROKER_URL: redis://redis:6379/0
-      MAX_RETRIES: "3"
+      HANDLER_RETRIES: "3"
     depends_on:
-      kafka-init:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     networks:
       - streaming
     restart: unless-stopped
 
-  # ---------- Log Consumer (Kafka -> OpenSearch + Redis) ----------
+  # ---------- Log Consumer (Redis Stream -> OpenSearch + Redis Pub/Sub) ----------
   log-consumer:
     build:
       context: .
       dockerfile: Dockerfile.log_consumer
-    image: localhost/fnndsc/compute-logs-consumer
+    image: localhost/fnndsc/compute-log-consumer
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
-      KAFKA_SASL_MECHANISM: PLAIN
-      KAFKA_SASL_USERNAME: log-consumer
-      KAFKA_SASL_PASSWORD: ${LOG_CONSUMER_PASSWORD:-log-consumer-secret}
-      KAFKA_CONSUMER_GROUP: log-consumer-group
-      OPENSEARCH_URL: http://opensearch:9200
       REDIS_URL: redis://redis:6379/0
+      STREAM_LOGS_BASE: stream:job-logs
+      STREAM_LOGS_DLQ: stream:job-logs-dlq
+      STREAM_NUM_SHARDS: "8"
+      LOG_CONSUMER_GROUP: log-consumer-group
+      OPENSEARCH_URL: http://opensearch:9200
       BATCH_MAX_SIZE: "200"
       BATCH_MAX_WAIT_SECONDS: "2.0"
     depends_on:
-      kafka-init:
-        condition: service_completed_successfully
       opensearch:
         condition: service_healthy
       redis:
@@ -341,11 +297,9 @@ services:
 # ============================================================================
 
 volumes:
-  kafka_data:
   opensearch_data:
   redis_data:
   postgres_data:
-  fluent_bit_db:
   storebase:
 
 # ============================================================================

@@ -7,9 +7,9 @@ This test exercises the complete system:
   POST /api/jobs/{id}/run
     → Celery start_workflow
       → pfcon schedule_copy → Docker container
-        → Event Forwarder → Kafka → Status Consumer → Celery process_job_status
+        → Event Forwarder → Redis Streams → Status Consumer → Celery process_job_status
           → PostgreSQL upsert + Redis Pub/Sub
-        → Fluent Bit → Kafka → Log Consumer → OpenSearch + Redis Pub/Sub
+        → Log Forwarder → Redis Streams → Log Consumer → OpenSearch + Redis Pub/Sub
       → workflow state machine: copy → plugin → upload → delete → cleanup
     → SSE Service streams events via /events/{id}/status and /events/{id}/logs
 

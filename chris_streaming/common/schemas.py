@@ -3,7 +3,7 @@ Pydantic models for messages flowing through the streaming pipeline.
 
 StatusEvent mirrors pfcon's JobInfo dataclass (abstractmgr.py).
 LogEvent represents a single log line from a container.
-Both are used for Kafka serialization/deserialization by all three services.
+Both are serialized as JSON bytes for Redis Streams XADD values.
 """
 
 from __future__ import annotations
@@ -73,16 +73,16 @@ class StatusEvent(BaseModel):
             raw = f"{self.job_id}:{self.job_type.value}:{self.status.value}:{self.timestamp}"
             self.event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
 
-    def serialize_for_kafka(self) -> bytes:
+    def serialize(self) -> bytes:
         return self.model_dump_json().encode("utf-8")
 
     @classmethod
-    def deserialize_from_kafka(cls, data: bytes) -> "StatusEvent":
+    def deserialize(cls, data: bytes) -> "StatusEvent":
         return cls.model_validate_json(data)
 
 
 class LogEvent(BaseModel):
-    """A single log line from a container, produced by Fluent Bit or the Event Forwarder."""
+    """A single log line from a container, produced by the Log Forwarder."""
     event_id: str = ""
     job_id: str
     job_type: JobType
@@ -104,14 +104,9 @@ class LogEvent(BaseModel):
             )
             self.event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
 
-    def serialize_for_kafka(self) -> bytes:
+    def serialize(self) -> bytes:
         return self.model_dump_json().encode("utf-8")
 
     @classmethod
-    def deserialize_from_kafka(cls, data: bytes) -> "LogEvent":
+    def deserialize(cls, data: bytes) -> "LogEvent":
         return cls.model_validate_json(data)
-
-
-def kafka_key_for_job(job_id: str) -> bytes:
-    """Kafka partition key: all events for the same job_id go to the same partition."""
-    return job_id.encode("utf-8")

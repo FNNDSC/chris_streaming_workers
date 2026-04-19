@@ -27,8 +27,8 @@ end
 %% =========================
 subgraph E["Event Pipeline"]
     EF["Event Forwarder<br/><i>async Docker/K8s watcher</i>"]
-    K1[("Kafka: job-status-events<br/><small>12 partitions · key=job_id · 3d retention</small>")]
-    ST["Status Consumer"]
+    RS1[("Redis Streams: stream:job-status:{0..N-1}<br/><small>sharded by md5(job_id) · AOF everysec · MAXLEN~ trim</small>")]
+    ST["Status Consumer<br/><small>lease-based shard owner</small>"]
     PG[("PostgreSQL")]
     CQ["Celery Task Queue<br/><small>(Redis broker)</small>"]
     CW["Celery Worker<br/><small>process_job_status + workflow orchestration</small>"]
@@ -38,9 +38,9 @@ end
 %% LOG PIPELINE
 %% =========================
 subgraph L["Log Pipeline"]
-    FB["Fluent Bit<br/><i>Docker log agent + Lua filter</i>"]
-    K2[("Kafka: job-logs<br/><small>12 partitions · key=job_id · 3d retention</small>")]
-    LC["Log Consumer"]
+    LS["Log Forwarder<br/><i>aiodocker / kubernetes-asyncio tailer</i>"]
+    RS2[("Redis Streams: stream:job-logs:{0..N-1}<br/><small>sharded by md5(job_id) · AOF everysec · MAXLEN~ trim</small>")]
+    LC["Log Consumer<br/><small>lease-based shard owner</small>"]
     ES[("OpenSearch")]
 end
 
@@ -64,9 +64,8 @@ PFCON -. "schedule /<br>delete" .-> K8S
 %% =========================
 DCKR -- "container events<br/>(create/start/die)" --> EF
 K8S -. "Job watch API<br/>(ADDED/MODIFIED)" .-> EF
-EF -- "StatusEvent<br/>(SASL/PLAIN)" --> K1
-EF -. "EOS marker<br/>(delayed)" .-> K2
-K1 --> ST
+EF -- "XADD StatusEvent" --> RS1
+RS1 -- "XREADGROUP" --> ST
 ST -- "all events" --> CQ
 CQ --> CW
 CW -- "upsert" --> PG
@@ -76,12 +75,12 @@ CW -- "workflow step<br/>advancement" --> PFCON
 %% =========================
 %% LOG FLOWS
 %% =========================
-DCKR -- "container log files<br/>(/var/lib/docker/containers/)" --> FB
-K8S -. "pod log files" .-> FB
-FB -- "LogEvent<br/>(SASL/PLAIN)" --> K2
-K2 --> LC
+DCKR -- "docker log API<br/>(stdout/stderr tail)" --> LS
+K8S -. "pod log API<br/>(stdout/stderr tail)" .-> LS
+LS -- "XADD LogEvent<br/>(+ eos=true on EOF)" --> RS2
+RS2 -- "XREADGROUP" --> LC
 LC -- "bulk _bulk API" --> ES
-LC -. "SET logs_flushed<br/>(on EOS)" .-> RD
+LC -. "SET logs_flushed<br/>(after flush, on EOS)" .-> RD
 
 %% =========================
 %% REAL-TIME FLOWS
@@ -105,8 +104,8 @@ classDef infra fill:#16213e,stroke:#3b82f6,color:#eee
 classDef runtime fill:#1a1a2e,stroke:#4ade80,color:#eee
 classDef ui fill:#16213e,stroke:#fbbf24,color:#eee
 
-class EF,ST,LC worker
-class K1,K2,PG,ES,RD,CQ,CW,FB infra
+class EF,ST,LC,LS worker
+class RS1,RS2,PG,ES,RD,CQ,CW infra
 class K8S,DCKR,PFCON runtime
 class SSE,UI ui
 ```
@@ -115,16 +114,19 @@ class SSE,UI ui
 
 ### Event pipeline (status changes)
 
-1. **pfcon** schedules containers on Docker or Kubernetes with `org.chrisproject.miniChRIS=plugininstance` and `org.chrisproject.job_type={copy|plugin|upload|delete}` labels.
+1. **pfcon** schedules containers on Docker or Kubernetes with a role label and a job-type label. The label key differs per runtime:
+   - Docker: `org.chrisproject.miniChRIS=plugininstance` and `org.chrisproject.job_type={copy|plugin|upload|delete}`
+   - Kubernetes: `chrisproject.org/role=plugininstance` and `chrisproject.org/job-type={copy|plugin|upload|delete}` (K8s-idiomatic `domain/key` format, set via pfcon's `JOB_LABELS` env)
 2. **Event Forwarder** watches the Docker daemon event stream (or K8s Job watch API), filtering by label.
    - On startup, lists all matching containers and emits their current state (restart-safe).
    - Maps native Docker states to pfcon's `JobStatus` enum using the same logic as `pfcon/compute/dockermgr.py:_get_status_from()`.
-   - Produces `StatusEvent` messages to Kafka topic `job-status-events`, keyed by `job_id`.
-   - Uses an idempotent Kafka producer and in-memory LRU deduplication.
-3. **Status Consumer** reads from `job-status-events` with manual offset commits:
-   - Schedules a **Celery task** `process_job_status` for every event.
-   - Has no direct Redis or PostgreSQL dependency — all persistence and publishing is delegated to the Celery Worker.
-   - Failed messages go to `job-status-events-dlq` after 3 retries.
+   - `XADD`s `StatusEvent` payloads to the sharded Redis stream `stream:job-status:{shard}`, where `shard = md5(job_id) mod N` (stable — the same `job_id` always lands on the same shard).
+   - Writes use `MAXLEN ~ <cap>` approximate trimming to bound stream growth.
+   - In-memory LRU deduplication suppresses re-emitting identical states.
+3. **Status Consumer** reads from the sharded status streams using `XREADGROUP`:
+   - Each replica acquires a **lease** (Redis `SET NX PX` with heartbeat refresh) for a subset of shards, making each shard a single-writer for ordering.
+   - On successful handling, calls `XACK`. A `PendingReclaimer` background task uses `XAUTOCLAIM`/`XPENDING` to recover entries left in the PEL by crashed consumers, and routes messages that exceed `reclaim_max_deliveries` to `stream:job-status-dlq`.
+   - Schedules a **Celery task** `process_job_status` for every event. The consumer has no direct Redis key-space or PostgreSQL dependency — all persistence and publishing is delegated to the Celery Worker.
 4. **Celery Worker** picks up every `process_job_status` task:
    - Upserts to **PostgreSQL** (`ON CONFLICT DO UPDATE` with timestamp guard — idempotent and order-safe).
    - Publishes the original status event to **Redis Pub/Sub** channel `job:{job_id}:status` for real-time SSE delivery.
@@ -133,19 +135,19 @@ class SSE,UI ui
 
 ### Log pipeline (container output)
 
-1. **Fluent Bit** tails Docker container JSON log files from `/var/lib/docker/containers/`.
-   - A Lua filter reads each container's `config.v2.json` to check for ChRIS labels and extract `job_id` + `job_type`.
-   - Non-ChRIS containers are dropped.
-   - Matching logs are reshaped to the `LogEvent` schema and forwarded to Kafka topic `job-logs`, keyed by `job_id`.
-2. **Event Forwarder** produces delayed EOS (End-of-Stream) markers to `job-logs`:
-   - When a terminal status event is detected (container die/finish), schedules a delayed EOS marker (default 10s).
-   - The delay gives Fluent Bit time to flush remaining log lines before the EOS arrives, but this is a best-effort hint, not a correctness guarantee (Kafka ordering is per-producer, not across producers — see the EOS section below).
-   - EOS markers use the same `job_id` as the partition key and reach the same partition as Fluent Bit's log lines, but interleaving across the two independent producers is possible in principle.
-3. **Log Consumer** reads from `job-logs` in configurable batches (default: 200 messages or 2 seconds):
+1. **Log Forwarder** (Python) tails container stdout/stderr directly from the compute runtime:
+   - In Docker mode, it uses `aiodocker` to attach to each matching container's log stream.
+   - In Kubernetes mode, it uses `kubernetes-asyncio` to follow pod logs.
+   - Filters by the same label selector as the Event Forwarder (`org.chrisproject.miniChRIS=plugininstance` on Docker, `chrisproject.org/role=plugininstance` on Kubernetes) so only ChRIS job containers are tailed.
+   - Extracts `job_id` + `job_type` from labels and reshapes each line to the `LogEvent` schema.
+   - `XADD`s each line to the sharded Redis stream `stream:job-logs:{shard}` keyed by the same `md5(job_id) mod N` hash, so a job's logs and status events share a shard ordering key.
+   - When the container's log stream closes (container exited and buffered output drained), emits a final `LogEvent` with `eos=true` on the same shard. EOS is sourced from the same stream iterator that produced the lines, so no line can arrive after the EOS.
+2. **Log Consumer** reads from the sharded log streams via `XREADGROUP` in configurable batches (default: 200 messages or 2 seconds):
    - Bulk-writes to **OpenSearch** using the `_bulk` API with daily index rotation (`job-logs-YYYY.MM.DD`).
    - Publishes each event to **Redis Pub/Sub** channel `job:{job_id}:logs`.
-   - Commits Kafka offsets only after a successful OpenSearch bulk write.
-   - When an EOS marker is received, triggers an immediate batch flush and sets a Redis key `job:{job_id}:{job_type}:logs_flushed` with 1-hour TTL, signaling that all logs are durably stored.
+   - `XACK`s messages only after a successful OpenSearch bulk write (at-least-once).
+   - Messages that repeatedly fail and exceed `reclaim_max_deliveries` are routed by the `PendingReclaimer` to `stream:job-logs-dlq`.
+   - When an EOS marker is in the batch, SETs `job:{job_id}:{job_type}:logs_flushed` with 1-hour TTL **after** the OpenSearch write succeeds (so the key cannot fire ahead of the data it attests to). If the write fails, the EOS stays pending and is retried.
 
 ### Real-time streaming layer
 
@@ -157,6 +159,7 @@ class SSE,UI ui
    - `POST /api/jobs/{job_id}/run` — submits a workflow via Celery (202 Accepted).
    - `GET /api/jobs/{job_id}/workflow` — queries workflow state (current step, status).
    - `GET /api/jobs/{job_id}/status/history` — queries all status records for a job.
+   - `GET /metrics` — snapshot of per-shard `XLEN`, PEL depth, and DLQ length for both pipelines. Used by smoke tests and operational dashboards.
 2. **Historical replay**: When an SSE client connects, the service first subscribes to Redis Pub/Sub (to start buffering live events), then replays historical events from PostgreSQL (statuses) and OpenSearch (logs). Events are deduplicated by `event_id` to prevent duplicates between historical and live data.
 3. **Test UI** (nginx + vanilla JS) proxies to the SSE service. The browser submits workflows via `POST /sse/api/jobs/{id}/run` and uses `EventSource` to subscribe to SSE streams. All workflow orchestration happens server-side.
 
@@ -209,18 +212,17 @@ Every `job:{id}:workflow` publish carries:
 
 ### EOS (End-of-Stream) mechanism
 
-The EOS mechanism is the **fast path** for knowing when a container's logs have been durably stored. It is a hint, not the correctness signal.
+The EOS mechanism is the **fast path** for knowing when a container's logs have been durably stored. It is a hint, not the correctness signal — a `eos_quiescence_seconds` backstop in `cleanup_containers` guarantees forward progress if the hint is missed.
 
-1. When the **Event Forwarder** detects a terminal container event (die), it schedules a delayed EOS marker (default 10s) to the `job-logs` Kafka topic.
-2. The delay gives Fluent Bit time to flush remaining log lines from the container's JSON log file before the EOS arrives. Under normal load this is comfortably long; under broker backpressure, client retries, or a lagging Fluent Bit it may not be.
-3. The EOS marker uses the same `job_id` partition key and therefore reaches the same partition as Fluent Bit's log lines. Kafka ordering is **per-producer** within a partition, so ordering across the two independent producers (Fluent Bit and the Event Forwarder) is not guaranteed by the broker.
-4. When the **Log Consumer** receives an EOS marker, it flushes the current batch to OpenSearch and sets a Redis key `job:{job_id}:{job_type}:logs_flushed`.
-5. The **Celery Worker**'s `cleanup_containers` task uses the Redis key as a fast path. If the key is missing, it falls back to a **terminal-status quiescence** check: once a step's terminal status has been recorded in `job_status` for at least `eos_quiescence_seconds` (default 10s), the logs are treated as drained and cleanup proceeds. This ensures cleanup never blocks forever on a missing EOS.
-6. For steps that complete immediately without creating containers (e.g., upload when `requires_upload_job=false`, or on pfcon scheduling failure), the `logs_flushed` key is set immediately by the Celery Worker.
+1. The **Log Forwarder** owns EOS emission because it is the only component that observes the true signal: the container's log stream EOF. In Docker mode this is when aiodocker's `container.log(follow=True)` iterator returns on both stdout and stderr; in Kubernetes mode it is when `read_namespaced_pod_log(follow=True)` drains. Both end only after the container has exited *and* all buffered output has been flushed by the runtime.
+2. When the stream closes cleanly, the Log Forwarder `XADD`s a final `LogEvent` with `eos=true` on the **same shard** as the preceding log lines (same `job_id`). Because both the log lines and the EOS marker come from the same in-process async iterator and the same `asyncio.Queue`, no line can possibly arrive after the EOS. This is the correctness difference from the old design: there is no timing-based delay to tune.
+3. The **Log Consumer** drains EOS markers with the regular batch. After the batch's OpenSearch bulk write succeeds, it SETs `job:{job_id}:{job_type}:logs_flushed` (TTL 3600s) for each EOS in the batch, then XACKs. The SET is gated on the flush success so the key only appears once the logs it attests to are durable in OpenSearch. If the flush fails, the EOS stays in the PEL and is retried — no premature signal.
+4. The **Celery Worker**'s `cleanup_containers` task uses the Redis key as a fast path. If the key is missing, it falls back to a **terminal-status quiescence** check: once a step's terminal status has been recorded in `job_status` for at least `eos_quiescence_seconds` (default 10s), the logs are treated as drained and cleanup proceeds. This guarantees cleanup never blocks forever on a missing EOS — e.g., Log Forwarder crash on container exit, or a container whose log stream closes abnormally.
+5. For steps that complete immediately without creating containers (e.g., upload when `requires_upload_job=false`, or on pfcon scheduling failure), the `logs_flushed` key is set immediately by the Celery Worker.
 
 ## Message schemas
 
-### StatusEvent (Kafka topic: `job-status-events`)
+### StatusEvent (stream: `stream:job-status:{shard}`)
 
 Mirrors pfcon's `JobInfo` dataclass from `pfcon/compute/abstractmgr.py`.
 
@@ -238,7 +240,7 @@ Mirrors pfcon's `JobInfo` dataclass from `pfcon/compute/abstractmgr.py`.
 | `timestamp` | `datetime` | ISO 8601 UTC |
 | `source` | `str` | `docker` or `kubernetes` |
 
-### LogEvent (Kafka topic: `job-logs`)
+### LogEvent (stream: `stream:job-logs:{shard}`)
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -251,37 +253,47 @@ Mirrors pfcon's `JobInfo` dataclass from `pfcon/compute/abstractmgr.py`.
 | `eos` | `bool` | End-of-Stream marker (default `false`). When `true`, signals all logs for this container have been flushed. |
 | `timestamp` | `datetime` | ISO 8601 UTC |
 
-## Kafka topic design
+## Redis Streams design
 
-All topics use `job_id` as the partition key, guaranteeing that all events for a single job are ordered within their partition.
+All events for a single job share one shard, guaranteeing ordering per job. Shard selection is a **stable hash**: `shard = int.from_bytes(md5(job_id).digest()[:4], "big") mod stream_num_shards`. This is the same `ShardRouter` used by the producers (Event Forwarder, Log Forwarder) and the consumers (Status Consumer, Log Consumer).
 
-| Topic | Partitions | Retention | Writers | Readers |
-|-------|-----------|-----------|---------|---------|
-| `job-status-events` | 12 | 3 days | `event-forwarder` | `status-consumer` |
-| `job-logs` | 12 | 3 days | `log-producer` (Fluent Bit), `event-forwarder` (EOS markers) | `log-consumer` |
-| `job-status-events-dlq` | 3 | 7 days | `status-consumer` | (manual inspection) |
-| `job-logs-dlq` | 3 | 7 days | `log-consumer` | (manual inspection) |
+| Stream base | Shards | Trim policy | Writers | Readers |
+|-------------|--------|-------------|---------|---------|
+| `stream:job-status:{shard}` | `stream_num_shards` (default 8) | `MAXLEN ~ stream_status_maxlen` (default 1M) | `event-forwarder` | `status-consumer` |
+| `stream:job-logs:{shard}` | `stream_num_shards` (default 8) | `MAXLEN ~ stream_logs_maxlen` (default 5M) | `log-forwarder` (log lines + EOS markers) | `log-consumer` |
+| `stream:job-status-dlq` | 1 | `MAXLEN ~ stream_dlq_maxlen` (default 100k) | `status-consumer` (via reclaimer) | (manual inspection) |
+| `stream:job-logs-dlq` | 1 | `MAXLEN ~ stream_dlq_maxlen` (default 100k) | `log-consumer` (via reclaimer) | (manual inspection) |
 
-SASL/PLAIN users (defined in `kafka_server_jaas.conf`) with least-privilege ACLs restrict each service to only the topics and operations it needs. The `admin` super-user is used only by the init script and inter-broker communication.
+Consumer groups (`status-consumer-group`, `log-consumer-group`) are created on startup with `MKSTREAM`. Each replica acquires a **shard lease** (`SET NX PX` on `lease:<stream>:<group>` with periodic refresh) so only one replica reads any given shard at a time — that is what makes `XREADGROUP + XACK` safe as a single-writer ordering primitive per job.
+
+The `PendingReclaimer` periodically scans `XPENDING` for entries older than `reclaim_min_idle_ms` on shards owned by this replica and uses `XAUTOCLAIM` to resume them. After `reclaim_max_deliveries` attempts, messages are `XADD`ed to the DLQ and `XACK`ed off the live stream.
 
 ## Resilience properties
 
-| Property | Event Forwarder | Status Consumer | Log Consumer |
-|----------|----------------|-----------------|--------------|
-| Stateless | Yes — no local state | Yes — state in Celery/PostgreSQL | Yes — state in OpenSearch |
-| Restart-safe | Re-lists all containers on startup | Resumes from committed Kafka offset | Resumes from committed Kafka offset |
-| Reconnects | Exponential backoff on Docker/K8s stream disconnect | Kafka client auto-reconnect | Kafka client auto-reconnect |
-| Dedup | Deterministic `event_id` + LRU cache + idempotent producer | PostgreSQL `ON CONFLICT` upsert (via Celery Worker) | OpenSearch document indexing |
-| Backpressure | Kafka producer buffering | Manual offset commit (at-least-once) | Batched processing with configurable flush |
-| Dead letters | — | `job-status-events-dlq` after N retries | `job-logs-dlq` (on deserialization failure) |
+| Property | Event Forwarder | Log Forwarder | Status Consumer | Log Consumer |
+|----------|----------------|-------------|-----------------|--------------|
+| Stateless | Yes — no local state | Yes — no local state | Yes — state in Celery/PostgreSQL | Yes — state in OpenSearch |
+| Restart-safe | Re-lists all containers on startup | Re-attaches to running container log streams | Resumes from PEL via `XAUTOCLAIM` | Resumes from PEL via `XAUTOCLAIM` |
+| Reconnects | Exponential backoff on Docker/K8s stream disconnect | Exponential backoff on docker/k8s log stream disconnect | `redis-py` async reconnect | `redis-py` async reconnect |
+| Dedup | Deterministic `event_id` + LRU cache | Deterministic `event_id` per line | PostgreSQL `ON CONFLICT` upsert (via Celery Worker) | OpenSearch document indexing |
+| Backpressure | Bounded streams via `MAXLEN ~` | Bounded streams via `MAXLEN ~` | Per-shard batch reads with explicit `XACK` | Batched processing with configurable flush |
+| Dead letters | — | — | `stream:job-status-dlq` after N deliveries | `stream:job-logs-dlq` after N deliveries |
+| Horizontal scale | Single writer (by design; idempotent on restart) | Single forwarder per compute runtime | Add replicas → each acquires a shard lease | Add replicas → each acquires a shard lease |
+
+## Durability and HA
+
+- **Single-node Redis** (default): `appendonly yes` + `appendfsync everysec` is configured everywhere Redis runs — the docker-compose `redis` service, `kubernetes/20-infra/redis.yaml`, and the integration-test Redis in `kubernetes/tests/integration-stack.yaml`. This bounds data loss to roughly one second of writes on an `fsync` gap.
+- **Sentinel HA** (opt-in): `kubernetes/20-infra/redis-ha.yaml` ships a 3-node replicated Redis StatefulSet with a separate 3-node Sentinel StatefulSet. Workers opt in by setting `REDIS_URL=redis+sentinel://redis-sentinel:26379/mymaster/0`. The `create_redis_client()` factory in `chris_streaming/common/redis_stream.py` detects the `redis+sentinel://` scheme and resolves the current master via `redis.asyncio.sentinel.Sentinel`, so no client code changes are needed to switch between single-node and Sentinel deployments.
 
 ## Status processing flow
 
 For every status event:
 
 ```
-Status Consumer
-  └── Celery send_task("process_job_status")
+Status Consumer (shard owner)
+  ├── XREADGROUP → PEL entry
+  ├── Celery send_task("process_job_status")
+  └── XACK on success
         │
         ▼
 Celery Worker
@@ -296,7 +308,7 @@ Celery Worker
               └── Wait for logs_flushed → DELETE containers → Mark completed
 ```
 
-The Status Consumer is a pure Kafka-to-Celery bridge with no direct Redis or PostgreSQL dependency. The Celery Worker handles all persistence (PostgreSQL), real-time delivery (Redis Pub/Sub), terminal confirmation, and workflow orchestration.
+The Status Consumer is a pure "Redis Streams → Celery" bridge with no direct key-space or PostgreSQL dependency. The Celery Worker handles all persistence (PostgreSQL), real-time delivery (Redis Pub/Sub), terminal confirmation, and workflow orchestration.
 
 The `confirmed_` prefix separates "the remote compute reported this" from "our backend acknowledged it." This is the hook where CUBE's processing logic (file registration, feed updates) would execute in production.
 

@@ -3,10 +3,12 @@ Entry point for the Event Forwarder daemon.
 
     python -m chris_streaming.event_forwarder
 
-Watches Docker or Kubernetes for ChRIS job container events and produces
-them to the Kafka job-status-events topic. For terminal events, also
-schedules delayed EOS markers to the job-logs topic so that the Log
-Consumer knows when all logs for a container have been flushed.
+Watches Docker or Kubernetes for ChRIS job container events and XADDs them
+to the sharded Redis Streams ``stream:job-status:{shard}``.
+
+The ``logs_flushed`` Redis signal is emitted by the Log Consumer after the
+container's log stream reaches EOF and its tail has been flushed to
+OpenSearch — not by this service.
 """
 
 from __future__ import annotations
@@ -17,11 +19,13 @@ import signal
 
 import structlog
 
-from chris_streaming.common.kafka import create_producer
-from chris_streaming.common.schemas import TERMINAL_STATUSES
+from chris_streaming.common.redis_stream import (
+    RedisStreamProducer,
+    StreamProducerConfig,
+    create_redis_client,
+)
 from chris_streaming.common.settings import EventForwarderSettings
 from .docker_watcher import DockerWatcher
-from .eos_producer import EOSProducer
 from .k8s_watcher import K8sWatcher
 from .producer import StatusEventProducer
 from .watcher import Watcher
@@ -50,25 +54,25 @@ async def main() -> None:
     logger.info(
         "Starting Event Forwarder",
         compute_env=settings.compute_env,
-        bootstrap_servers=settings.kafka_bootstrap_servers,
+        redis_url=settings.redis_url,
+        stream_base=settings.stream_status_base,
+        num_shards=settings.stream_num_shards,
     )
 
-    # Create Kafka producer for status events
-    kafka_producer = await create_producer(settings)
-    producer = StatusEventProducer(kafka_producer, settings.kafka_topic_status)
+    redis = await create_redis_client(settings.redis_url)
 
-    # Create Kafka producer for EOS markers on job-logs topic
-    eos_kafka_producer = await create_producer(settings)
-    eos_producer = EOSProducer(
-        eos_kafka_producer,
-        settings.kafka_topic_logs,
-        delay_seconds=settings.eos_delay_seconds,
+    stream_producer = RedisStreamProducer(
+        redis,
+        StreamProducerConfig(
+            base_stream=settings.stream_status_base,
+            num_shards=settings.stream_num_shards,
+            maxlen_approx=settings.stream_status_maxlen,
+        ),
     )
+    producer = StatusEventProducer(stream_producer)
 
-    # Create compute runtime watcher
     watcher = _create_watcher(settings)
 
-    # Graceful shutdown
     shutdown_event = asyncio.Event()
 
     def _shutdown(sig):
@@ -85,14 +89,10 @@ async def main() -> None:
                 if shutdown_event.is_set():
                     break
                 await producer.send(event)
-                # Schedule EOS marker for terminal status events
-                if event.status in TERMINAL_STATUSES:
-                    eos_producer.schedule_eos(event.job_id, event.job_type)
     finally:
         logger.info("Shutting down producers")
-        await eos_producer.cancel_all()
-        await eos_kafka_producer.stop()
         await producer.close()
+        await redis.close()
         logger.info("Event Forwarder stopped")
 
 
