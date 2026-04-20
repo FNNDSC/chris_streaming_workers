@@ -1,7 +1,7 @@
 """Shared fixtures for integration tests.
 
 All integration tests require Docker Compose infrastructure
-(Redis, OpenSearch, PostgreSQL) running.
+(Redis, Quickwit, PostgreSQL) running.
 """
 
 import os
@@ -19,8 +19,13 @@ def redis_url():
 
 
 @pytest.fixture(scope="session")
-def opensearch_url():
-    return _require_env("OPENSEARCH_URL", "http://localhost:9200")
+def quickwit_url():
+    return _require_env("QUICKWIT_URL", "http://localhost:7280")
+
+
+@pytest.fixture(scope="session")
+def quickwit_index():
+    return _require_env("QUICKWIT_INDEX", "job-logs")
 
 
 @pytest.fixture(scope="session")

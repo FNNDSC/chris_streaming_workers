@@ -41,7 +41,7 @@ subgraph L["Log Pipeline"]
     LS["Log Forwarder<br/><i>aiodocker / kubernetes-asyncio tailer</i>"]
     RS2[("Redis Streams: stream:job-logs:{0..N-1}<br/><small>sharded by md5(job_id) · AOF everysec · MAXLEN~ trim</small>")]
     LC["Log Consumer<br/><small>lease-based shard owner</small>"]
-    ES[("OpenSearch")]
+    QW[("Quickwit")]
 end
 
 %% =========================
@@ -143,24 +143,24 @@ class SSE,UI ui
    - `XADD`s each line to the sharded Redis stream `stream:job-logs:{shard}` keyed by the same `md5(job_id) mod N` hash, so a job's logs and status events share a shard ordering key.
    - When the container's log stream closes (container exited and buffered output drained), emits a final `LogEvent` with `eos=true` on the same shard. EOS is sourced from the same stream iterator that produced the lines, so no line can arrive after the EOS.
 2. **Log Consumer** reads from the sharded log streams via `XREADGROUP` in configurable batches (default: 200 messages or 2 seconds):
-   - Bulk-writes to **OpenSearch** using the `_bulk` API with daily index rotation (`job-logs-YYYY.MM.DD`).
+   - Ingests to **Quickwit** via `POST /api/v1/{index}/ingest?commit=force` (NDJSON). The `commit=force` flag blocks until the documents are committed and searchable — ensuring the EOS / `logs_flushed` contract holds.
    - Publishes each event to **Redis Pub/Sub** channel `job:{job_id}:logs`.
-   - `XACK`s messages only after a successful OpenSearch bulk write (at-least-once).
-   - Messages that repeatedly fail and exceed `reclaim_max_deliveries` are routed by the `PendingReclaimer` to `stream:job-logs-dlq`.
-   - When an EOS marker is in the batch, SETs `job:{job_id}:{job_type}:logs_flushed` with 1-hour TTL **after** the OpenSearch write succeeds (so the key cannot fire ahead of the data it attests to). If the write fails, the EOS stays pending and is retried.
+   - `XACK`s messages only after a successful Quickwit ingest (at-least-once).
+   - Messages that repeatedly fail and exceed `reclaim_max_deliveries` are routed by the `PendingReclaimer` to `stream:job-logs-dlq`. Unlike the Status Consumer there is no shard lease: every replica sweeps every shard, and the atomic `XCLAIM` prevents double-processing.
+   - When an EOS marker is in the batch, SETs `job:{job_id}:{job_type}:logs_flushed` with 1-hour TTL **after** the Quickwit write succeeds (so the key cannot fire ahead of the data it attests to). If the write fails, the EOS stays pending and is retried.
 
 ### Real-time streaming layer
 
 1. **SSE Service** (FastAPI) exposes SSE and REST endpoints:
    - `GET /events/{job_id}/status` — subscribes to Redis `job:{job_id}:status`, streams as SSE with historical replay from PostgreSQL.
-   - `GET /events/{job_id}/logs` — subscribes to Redis `job:{job_id}:logs`, streams as SSE with historical replay from OpenSearch.
+   - `GET /events/{job_id}/logs` — subscribes to Redis `job:{job_id}:logs`, streams as SSE with historical replay from Quickwit.
    - `GET /events/{job_id}/all` — subscribes to both channels with full historical replay.
-   - `GET /logs/{job_id}/history` — queries OpenSearch for historical logs (JSON).
+   - `GET /logs/{job_id}/history` — queries Quickwit for historical logs (JSON).
    - `POST /api/jobs/{job_id}/run` — submits a workflow via Celery (202 Accepted).
    - `GET /api/jobs/{job_id}/workflow` — queries workflow state (current step, status).
    - `GET /api/jobs/{job_id}/status/history` — queries all status records for a job.
    - `GET /metrics` — snapshot of per-shard `XLEN`, PEL depth, and DLQ length for both pipelines. Used by smoke tests and operational dashboards.
-2. **Historical replay**: When an SSE client connects, the service first subscribes to Redis Pub/Sub (to start buffering live events), then replays historical events from PostgreSQL (statuses) and OpenSearch (logs). Events are deduplicated by `event_id` to prevent duplicates between historical and live data.
+2. **Historical replay**: When an SSE client connects, the service first subscribes to Redis Pub/Sub (to start buffering live events), then replays historical events from PostgreSQL (statuses) and Quickwit (logs). Events are deduplicated by `event_id` to prevent duplicates between historical and live data.
 3. **Test UI** (nginx + vanilla JS) proxies to the SSE service. The browser submits workflows via `POST /sse/api/jobs/{id}/run` and uses `EventSource` to subscribe to SSE streams. All workflow orchestration happens server-side.
 
 ### Workflow orchestration
@@ -216,7 +216,7 @@ The EOS mechanism is the **fast path** for knowing when a container's logs have 
 
 1. The **Log Forwarder** owns EOS emission because it is the only component that observes the true signal: the container's log stream EOF. In Docker mode this is when aiodocker's `container.log(follow=True)` iterator returns on both stdout and stderr; in Kubernetes mode it is when `read_namespaced_pod_log(follow=True)` drains. Both end only after the container has exited *and* all buffered output has been flushed by the runtime.
 2. When the stream closes cleanly, the Log Forwarder `XADD`s a final `LogEvent` with `eos=true` on the **same shard** as the preceding log lines (same `job_id`). Because both the log lines and the EOS marker come from the same in-process async iterator and the same `asyncio.Queue`, no line can possibly arrive after the EOS. This is the correctness difference from the old design: there is no timing-based delay to tune.
-3. The **Log Consumer** drains EOS markers with the regular batch. After the batch's OpenSearch bulk write succeeds, it SETs `job:{job_id}:{job_type}:logs_flushed` (TTL 3600s) for each EOS in the batch, then XACKs. The SET is gated on the flush success so the key only appears once the logs it attests to are durable in OpenSearch. If the flush fails, the EOS stays in the PEL and is retried — no premature signal.
+3. The **Log Consumer** drains EOS markers with the regular batch. After the batch's Quickwit ingest (`commit=force`) succeeds, it SETs `job:{job_id}:{job_type}:logs_flushed` (TTL 3600s) for each EOS in the batch, then XACKs. The SET is gated on the flush success so the key only appears once the logs it attests to are durable in Quickwit. If the write fails, the EOS stays in the PEL and is retried — no premature signal.
 4. The **Celery Worker**'s `cleanup_containers` task uses the Redis key as a fast path. If the key is missing, it falls back to a **terminal-status quiescence** check: once a step's terminal status has been recorded in `job_status` for at least `eos_quiescence_seconds` (default 10s), the logs are treated as drained and cleanup proceeds. This guarantees cleanup never blocks forever on a missing EOS — e.g., Log Forwarder crash on container exit, or a container whose log stream closes abnormally.
 5. For steps that complete immediately without creating containers (e.g., upload when `requires_upload_job=false`, or on pfcon scheduling failure), the `logs_flushed` key is set immediately by the Celery Worker.
 
@@ -272,10 +272,10 @@ The `PendingReclaimer` periodically scans `XPENDING` for entries older than `rec
 
 | Property | Event Forwarder | Log Forwarder | Status Consumer | Log Consumer |
 |----------|----------------|-------------|-----------------|--------------|
-| Stateless | Yes — no local state | Yes — no local state | Yes — state in Celery/PostgreSQL | Yes — state in OpenSearch |
+| Stateless | Yes — no local state | Yes — no local state | Yes — state in Celery/PostgreSQL | Yes — state in Quickwit |
 | Restart-safe | Re-lists all containers on startup | Re-attaches to running container log streams | Resumes from PEL via `XAUTOCLAIM` | Resumes from PEL via `XAUTOCLAIM` |
 | Reconnects | Exponential backoff on Docker/K8s stream disconnect | Exponential backoff on docker/k8s log stream disconnect | `redis-py` async reconnect | `redis-py` async reconnect |
-| Dedup | Deterministic `event_id` + LRU cache | Deterministic `event_id` per line | PostgreSQL `ON CONFLICT` upsert (via Celery Worker) | OpenSearch document indexing |
+| Dedup | Deterministic `event_id` + LRU cache | Deterministic `event_id` per line | PostgreSQL `ON CONFLICT` upsert (via Celery Worker) | Quickwit document indexing |
 | Backpressure | Bounded streams via `MAXLEN ~` | Bounded streams via `MAXLEN ~` | Per-shard batch reads with explicit `XACK` | Batched processing with configurable flush |
 | Dead letters | — | — | `stream:job-status-dlq` after N deliveries | `stream:job-logs-dlq` after N deliveries |
 | Horizontal scale | Single writer (by design; idempotent on restart) | Single forwarder per compute runtime | Add replicas → each acquires a shard lease | Add replicas → each acquires a shard lease |

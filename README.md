@@ -15,7 +15,7 @@ Docker/K8s Runtime → Event Forwarder → Redis Stream [stream:job-status:{shar
 
 **Log Pipeline** (container output):
 ```
-Docker/K8s Runtime → Log Forwarder → Redis Stream [stream:job-logs:{shard}] → Log Consumer → OpenSearch + Redis Pub/Sub
+Docker/K8s Runtime → Log Forwarder → Redis Stream [stream:job-logs:{shard}] → Log Consumer → Quickwit + Redis Pub/Sub
                                    └ (EOS on log-stream EOF) ┘                              └ SET logs_flushed (post-flush) ┘
 ```
 
@@ -34,7 +34,7 @@ Docker events → Event Forwarder → Redis Stream → Status Consumer → Celer
 Both pipelines feed into a real-time streaming layer with historical replay:
 ```
 Redis Pub/Sub → SSE Service → Browser (EventSource)
-PostgreSQL + OpenSearch → SSE Service → Browser (historical replay on connect)
+PostgreSQL + Quickwit → SSE Service → Browser (historical replay on connect)
 ```
 
 Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a given job live on one shard and preserve order, while total throughput scales with the number of shards. Consumers acquire a **lease** per shard (`SET NX PX` with heartbeat refresh) so every shard has exactly one live reader at a time. A background `PendingReclaimer` uses `XAUTOCLAIM`/`XPENDING` to recover messages left in the PEL by crashed consumers and routes them to a DLQ after `N` delivery attempts.
@@ -47,16 +47,16 @@ Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a
 
 - **Status Consumer** (`compute-status-consumer`) — Reads status events via `XREADGROUP` from the sharded status streams, then schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Each replica acquires a lease for a subset of shards; a `PendingReclaimer` recovers PEL entries from crashed workers and routes to `stream:job-status-dlq` after the configured retry budget.
 
-- **Log Consumer** (`compute-log-consumer`) — Batched Redis Streams consumer that reads log events from `stream:job-logs:{shard}` (lines and EOS markers, both produced by the Log Forwarder), bulk-writes to OpenSearch for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker appears in the batch, SETs `job:{id}:{type}:logs_flushed` (TTL 1h) **after** the OpenSearch write succeeds so the key cannot fire ahead of the data it attests to. Configurable batch size and flush interval.
+- **Log Consumer** (`compute-log-consumer`) — Batched Redis Streams consumer that reads log events from `stream:job-logs:{shard}` (lines and EOS markers, both produced by the Log Forwarder), ingests into Quickwit (`/api/v1/{index}/ingest?commit=force`) for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker appears in the batch, SETs `job:{id}:{type}:logs_flushed` (TTL 1h) **after** the Quickwit commit succeeds so the key cannot fire ahead of the data it attests to. Configurable batch size and flush interval. Horizontal scaling is safe: all replicas share a single consumer group, and a `PendingReclaimer` sweep (with atomic `XCLAIM`) recovers entries left in the PEL by crashed replicas.
 
 ### Supporting components
 
 The repository also includes supporting infrastructure and a pilot test environment to demonstrate the full pipeline end-to-end:
 
 - **Redis** (single instance by default, with `appendonly yes` + `appendfsync everysec` for durability) — carries Streams (event + log transport), Pub/Sub fan-out, and the Celery broker. An opt-in Sentinel HA topology is provided at [kubernetes/20-infra/redis-ha.yaml](kubernetes/20-infra/redis-ha.yaml) (3 Redis replicas + 3 Sentinels), selectable via a `redis+sentinel://` URL.
-- **OpenSearch** for log storage and historical replay.
+- **Quickwit** for log storage and historical replay.
 - **PostgreSQL** for durable status tracking (written by the Celery Worker).
-- **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/OpenSearch on connect, exposes REST endpoints for workflow submission and status queries, and exposes a `/metrics` endpoint that reports per-shard stream depth, PEL depth, and DLQ length for both pipelines.
+- **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/Quickwit on connect, exposes REST endpoints for workflow submission and status queries, and exposes a `/metrics` endpoint that reports per-shard stream depth, PEL depth, and DLQ length for both pipelines.
 - **Celery Worker** that processes status confirmations, orchestrates the workflow state machine (copy → plugin → upload → delete → cleanup), calls pfcon to advance steps, honours pfcon's `requires_copy_job` / `requires_upload_job` flags to skip optional steps, and waits for log flush (or terminal-status quiescence) before container cleanup. At cleanup time it computes the overall workflow status (`finishedSuccessfully`, `finishedWithError`, or `failed`) from the recorded per-step outcomes.
 - **pfcon** (`ghcr.io/fnndsc/pfcon:latest`, which includes `org.chrisproject.job_type` labels) as the job control plane.
 - **Test UI** for submitting jobs via the SSE service and watching status + logs stream in real-time.
@@ -112,7 +112,7 @@ chris_streaming_workers/
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.log_consumer
 │   │   ├── consumer.py                         # Batched XREADGROUP consumer
-│   │   ├── opensearch_writer.py                # Bulk writes with daily index rotation
+│   │   ├── quickwit_writer.py                  # Quickwit ingest wrapper (commit=force)
 │   │   └── redis_publisher.py                  # Per-job Pub/Sub fan-out
 │   │
 │   ├── log_forwarder/                          # Produces to stream:job-logs (lines + EOS)
@@ -132,8 +132,8 @@ chris_streaming_workers/
 │       └── tasks.py                            # Celery tasks: process_job_status, start_workflow, cleanup_containers
 │
 ├── config/
-│   ├── opensearch/
-│   │   └── index-template.json                 # job-logs-* index mapping
+│   ├── quickwit/
+│   │   └── job-logs-index.yaml                 # Quickwit index config (raw tokenizer on keyword fields)
 │   └── init-test-data.sh                       # Create sample files in storeBase
 │
 ├── test_ui/
@@ -146,14 +146,14 @@ chris_streaming_workers/
 ├── tests/
 │   ├── conftest.py
 │   ├── unit/                                   # Pure unit tests (no network)
-│   ├── integration/                            # Redis, OpenSearch, PostgreSQL integration tests
+│   ├── integration/                            # Redis, Quickwit, PostgreSQL integration tests
 │   └── e2e/                                    # Full-stack workflow tests
 │
 └── kubernetes/                                 # Kubernetes manifests (parallel to docker-compose)
     ├── README.md                               # K8s deployment and testing guide
     ├── kustomization.yaml                      # Kustomize entrypoint
     ├── 00-namespace.yaml
-    ├── 20-infra/                               # Redis (+ optional redis-ha), OpenSearch, Postgres
+    ├── 20-infra/                               # Redis (+ optional redis-ha), Quickwit, Postgres
     ├── 30-pfcon/                               # pfcon with KubernetesManager
     ├── 40-workers/                             # event-forwarder, status/log consumers, log-forwarder, SSE, celery
     ├── 50-ui/                                  # Test UI (nginx)
@@ -167,14 +167,14 @@ All services run on a single `streaming` Docker network.
 | # | Service | Image | Role | Exposed Ports |
 |---|---------|-------|------|---------------|
 | 1 | `redis` | `redis:7-alpine` | Streams transport + Pub/Sub + Celery broker (AOF everysec) | 6379 |
-| 2 | `opensearch` | `opensearchproject/opensearch:2.18.0` | Log storage and search | 9200 |
+| 2 | `quickwit` | `quickwit/quickwit:latest` | Log storage and search (Tantivy index, `/api/v1`) | 7280 |
 | 3 | `postgres` | `postgres:16-alpine` | Celery worker DB | 5433 |
 | 4 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
 | 5 | `init-test-data` | `alpine:latest` | Creates sample fslink test data (run-once) | — |
 | 6 | `event-forwarder` | `localhost/fnndsc/compute-event-forwarder` | Docker events → `stream:job-status` | — |
 | 7 | `log-forwarder` | `localhost/fnndsc/compute-log-forwarder` | Docker container logs → `stream:job-logs` | — |
 | 8 | `status-consumer` | `localhost/fnndsc/compute-status-consumer` | `stream:job-status` → Celery | — |
-| 9 | `log-consumer` | `localhost/fnndsc/compute-log-consumer` | `stream:job-logs` → OpenSearch + Redis Pub/Sub | — |
+| 9 | `log-consumer` | `localhost/fnndsc/compute-log-consumer` | `stream:job-logs` → Quickwit + Redis Pub/Sub | — |
 | 10 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming + `/metrics` | 8080 |
 | 11 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
 | 12 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
@@ -186,7 +186,7 @@ init-test-data ──→ pfcon
 redis ──→ event-forwarder
       ├──→ log-forwarder
       ├──→ status-consumer
-      └──→ log-consumer    (also needs opensearch)
+      └──→ log-consumer    (also needs quickwit)
 redis + postgres + pfcon ──→ celery-worker
 redis + postgres ──→ sse-service
 sse-service ──→ test-ui
@@ -245,9 +245,9 @@ This builds the custom service images, pulls infrastructure images (including pf
 | http://localhost:8080/events/{job_id}/status | SSE status stream (with historical replay) |
 | http://localhost:8080/events/{job_id}/logs | SSE log stream (with historical replay) |
 | http://localhost:8080/events/{job_id}/all | SSE combined stream (with historical replay) |
-| http://localhost:8080/logs/{job_id}/history | Historical logs from OpenSearch |
+| http://localhost:8080/logs/{job_id}/history | Historical logs from Quickwit |
 | http://localhost:30005/api/v1/ | pfcon API (direct) |
-| http://localhost:9200 | OpenSearch API |
+| http://localhost:7280 | Quickwit API (UI at `/ui`) |
 
 ### Run a test job via the UI
 
@@ -308,8 +308,11 @@ docker compose exec redis redis-cli XRANGE stream:job-status-dlq - + COUNT 10
 docker compose exec postgres psql -U chris chris_streaming \
   -c "SELECT job_id, job_type, status, updated_at FROM job_status ORDER BY updated_at;"
 
-# Query OpenSearch for logs
-curl -s 'http://localhost:9200/job-logs-*/_search?q=job_id:test-job-1&sort=timestamp:asc&size=20' | jq '.hits.hits[]._source.line'
+# Query Quickwit for logs
+curl -s -X POST -H 'Content-Type: application/json' \
+  'http://localhost:7280/api/v1/job-logs/search' \
+  -d '{"query": "job_id:\"test-job-1\"", "max_hits": 20, "sort_by": "timestamp"}' \
+  | jq '.hits[].line'
 ```
 
 ### Stop and clean up
@@ -327,7 +330,7 @@ docker compose down -v # stop and remove all volumes (full reset)
 
 ### Running automated tests
 
-Tests are split into three levels — **unit tests** (no infrastructure, fast), **integration tests** (require Redis, OpenSearch, PostgreSQL), and **end-to-end tests** (require the full application stack). All run entirely in Docker via `docker-compose.test.yml` and `Dockerfile.test`, using Docker Compose profiles to start only the services needed for each level.
+Tests are split into three levels — **unit tests** (no infrastructure, fast), **integration tests** (require Redis, Quickwit, PostgreSQL), and **end-to-end tests** (require the full application stack). All run entirely in Docker via `docker-compose.test.yml` and `Dockerfile.test`, using Docker Compose profiles to start only the services needed for each level.
 
 #### Using `just` (recommended)
 
@@ -337,7 +340,7 @@ Install [just](https://github.com/casey/just), then:
 # Run unit tests (no infrastructure needed, fast)
 just run unit-tests
 
-# Run integration tests (spins up Redis, OpenSearch, PostgreSQL)
+# Run integration tests (spins up Redis, Quickwit, PostgreSQL)
 just run integration-tests
 
 # Run E2E tests (starts full application stack, submits real workflows)
@@ -376,13 +379,14 @@ tests/
 │   ├── test_common/                      # schemas, pfcon_status, container_naming, settings, redis_stream, stream_metrics
 │   ├── test_event_forwarder/             # producer, docker_watcher, k8s_watcher
 │   ├── test_status_consumer/             # consumer, notifier
-│   ├── test_log_consumer/                # consumer, opensearch_writer, redis_publisher
+│   ├── test_log_consumer/                # consumer, quickwit_writer, reclaim, redis_publisher
 │   ├── test_log_forwarder/               # forwarder, tailer
 │   └── test_sse_service/                 # app, routes, pfcon_client, tasks
 ├── integration/                          # Requires Docker Compose infrastructure
 │   ├── test_redis_streams_roundtrip.py   # XADD / XREADGROUP / XACK + reclaimer + DLQ
 │   ├── test_redis_pubsub.py              # Pub/Sub and key operations
-│   ├── test_opensearch_writer.py         # Bulk writes and queries
+│   ├── test_quickwit.py                  # Quickwit ingest + search against live instance
+│   ├── test_log_consumer_reclaim.py      # PEL reclaim + DLQ via PendingReclaimer
 │   ├── test_postgres.py                  # Schema creation and upsert logic
 │   └── test_sse_health.py                # FastAPI health endpoint
 └── e2e/                                  # Requires full application stack
@@ -390,8 +394,8 @@ tests/
 ```
 
 - **Unit tests** use `fakeredis` and mocks exclusively — no network or container dependencies.
-- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Redis Streams XADD/XREADGROUP/XACK, Redis Pub/Sub, OpenSearch bulk writes, PostgreSQL upserts, reclaimer + DLQ behavior).
-- **E2E tests** are marked with `@pytest.mark.e2e` and exercise the full pipeline: submit a job via `POST /api/jobs/{id}/run`, verify status events arrive through the SSE stream, check workflow completion, and confirm logs appear in OpenSearch. Includes tests for successful workflows, failure scenarios (bad image), and historical replay for late-connecting SSE clients.
+- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Redis Streams XADD/XREADGROUP/XACK, Redis Pub/Sub, Quickwit ingest + search, PostgreSQL upserts, reclaimer + DLQ behavior).
+- **E2E tests** are marked with `@pytest.mark.e2e` and exercise the full pipeline: submit a job via `POST /api/jobs/{id}/run`, verify status events arrive through the SSE stream, check workflow completion, and confirm logs appear in Quickwit. Includes tests for successful workflows, failure scenarios (bad image), and historical replay for late-connecting SSE clients.
 
 
 ## Configuration
@@ -459,8 +463,8 @@ Requires the Docker socket (Docker mode) or in-cluster K8s config (Kubernetes mo
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOG_CONSUMER_GROUP` | `log-consumer-group` | Consumer group name |
-| `OPENSEARCH_URL` | `http://opensearch:9200` | OpenSearch endpoint |
-| `OPENSEARCH_INDEX_PREFIX` | `job-logs` | Daily index prefix (`job-logs-YYYY.MM.DD`) |
+| `QUICKWIT_URL` | `http://quickwit:7280` | Quickwit endpoint |
+| `QUICKWIT_INDEX` | `job-logs` | Quickwit index name |
 | `BATCH_MAX_SIZE` | `200` | Max messages per batch before flush |
 | `BATCH_MAX_WAIT_SECONDS` | `2.0` | Max seconds before flushing a partial batch |
 
@@ -470,8 +474,8 @@ Requires the Docker socket (Docker mode) or in-cluster K8s config (Kubernetes mo
 |----------|---------|-------------|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8080` | Bind port |
-| `OPENSEARCH_URL` | `http://opensearch:9200` | OpenSearch for historical log queries |
-| `OPENSEARCH_INDEX_PREFIX` | `job-logs` | Index prefix matching the Log Consumer |
+| `QUICKWIT_URL` | `http://quickwit:7280` | Quickwit for historical log queries |
+| `QUICKWIT_INDEX` | `job-logs` | Quickwit index name (must match the Log Consumer) |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker |
 | `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
 | `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |

@@ -33,8 +33,10 @@ spec:
               value: "8"
             - name: LOG_CONSUMER_GROUP
               value: log-consumer-group
-            - name: OPENSEARCH_URL
-              value: http://opensearch:9200
+            - name: QUICKWIT_URL
+              value: http://quickwit:7280
+            - name: QUICKWIT_INDEX
+              value: job-logs
             - name: BATCH_MAX_SIZE
               value: "200"
             - name: BATCH_MAX_WAIT_SECONDS

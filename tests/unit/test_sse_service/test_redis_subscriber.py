@@ -1,7 +1,7 @@
 """Tests for chris_streaming.sse_service.redis_subscriber.
 
 Focus: log-replay deduplication. A log event that arrives both via
-OpenSearch replay and via the live Redis Pub/Sub buffer must be
+Quickwit replay and via the live Redis Pub/Sub buffer must be
 yielded only once.
 """
 
@@ -74,7 +74,7 @@ class TestLogReplayDedup:
 
         buffer_ready = asyncio.Event()
 
-        async def fake_replay_logs(url, prefix, job_id):
+        async def fake_replay_logs(url, index_id, job_id):
             # Wait until fake_buffer has populated the buffer before the
             # replay phase yields — ensures the dedup path is exercised.
             await asyncio.wait_for(buffer_ready.wait(), timeout=1.0)
@@ -103,7 +103,7 @@ class TestLogReplayDedup:
                 redis_url="redis://fake",
                 job_id="j1",
                 event_type="logs",
-                opensearch_url="http://fake",
+                quickwit_url="http://fake",
             )
 
             # The generator's Phase 4 live loop never terminates on its own
@@ -133,7 +133,7 @@ class TestLogReplayDedup:
 
         buffer_ready = asyncio.Event()
 
-        async def fake_replay_logs(url, prefix, job_id):
+        async def fake_replay_logs(url, index_id, job_id):
             # Wait until fake_buffer has populated the buffer so the
             # buffer-drain phase of subscribe_to_job actually has something
             # to yield.
@@ -174,7 +174,7 @@ class TestLogReplayDedup:
                 redis_url="redis://fake",
                 job_id="j1",
                 event_type="logs",
-                opensearch_url="http://fake",
+                quickwit_url="http://fake",
             )
 
             results = await _drain_with_timeout(agen, duration=0.3)

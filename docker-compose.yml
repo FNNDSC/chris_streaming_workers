@@ -3,7 +3,7 @@
 #
 # Includes:
 #   Infrastructure:  Redis (Streams + Pub/Sub + Celery broker, AOF enabled),
-#                    OpenSearch, PostgreSQL
+#                    Quickwit, PostgreSQL
 #   Custom services: Event Forwarder, Status Consumer, Log Consumer,
 #                    Log Forwarder, SSE Service, Celery Worker
 #   Existing:        pfcon (ghcr.io/fnndsc/pfcon:latest)
@@ -20,21 +20,21 @@ services:
   # INFRASTRUCTURE
   # ==========================================================================
 
-  # ---------- OpenSearch (single-node, security disabled for dev) ----------
-  opensearch:
-    image: opensearchproject/opensearch:2.18.0
+  # ---------- Quickwit (filesystem-backed single-node indexer + searcher) ----------
+  quickwit:
+    image: quickwit/quickwit:latest
+    command: ["run"]
     environment:
-      discovery.type: single-node
-      DISABLE_SECURITY_PLUGIN: "true"
-      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      QW_METASTORE_URI: "file:///quickwit/qwdata/metastore"
+      QW_DEFAULT_INDEX_ROOT_URI: "file:///quickwit/qwdata/indexes"
     volumes:
-      - opensearch_data:/usr/share/opensearch/data
+      - quickwit_data:/quickwit/qwdata
     ports:
-      - "9200:9200"
+      - "7280:7280"
     networks:
       - streaming
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:7280/health/livez >/dev/null 2>&1 || curl -sf http://localhost:7280/health/livez || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -201,7 +201,7 @@ services:
       - streaming
     restart: unless-stopped
 
-  # ---------- Log Consumer (Redis Stream -> OpenSearch + Redis Pub/Sub) ----------
+  # ---------- Log Consumer (Redis Stream -> Quickwit + Redis Pub/Sub) ----------
   log-consumer:
     build:
       context: .
@@ -213,11 +213,12 @@ services:
       STREAM_LOGS_DLQ: stream:job-logs-dlq
       STREAM_NUM_SHARDS: "8"
       LOG_CONSUMER_GROUP: log-consumer-group
-      OPENSEARCH_URL: http://opensearch:9200
+      QUICKWIT_URL: http://quickwit:7280
+      QUICKWIT_INDEX: job-logs
       BATCH_MAX_SIZE: "200"
       BATCH_MAX_WAIT_SECONDS: "2.0"
     depends_on:
-      opensearch:
+      quickwit:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -232,7 +233,8 @@ services:
       dockerfile: Dockerfile.sse_service
     environment:
       REDIS_URL: redis://redis:6379/0
-      OPENSEARCH_URL: http://opensearch:9200
+      QUICKWIT_URL: http://quickwit:7280
+      QUICKWIT_INDEX: job-logs
       CELERY_BROKER_URL: redis://redis:6379/0
       DB_DSN: postgresql://${POSTGRES_USER:-chris}:${POSTGRES_PASSWORD:-chris1234}@postgres:5432/${POSTGRES_DB:-chris_streaming}
       PFCON_URL: http://pfcon:30005
@@ -245,7 +247,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      opensearch:
+      quickwit:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -297,7 +299,7 @@ services:
 # ============================================================================
 
 volumes:
-  opensearch_data:
+  quickwit_data:
   redis_data:
   postgres_data:
   storebase:

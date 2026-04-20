@@ -11,5 +11,6 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY --from=builder /install /usr/local
 COPY chris_streaming/ chris_streaming/
+COPY config/quickwit/ config/quickwit/
 
 CMD ["python", "-m", "chris_streaming.log_consumer"]

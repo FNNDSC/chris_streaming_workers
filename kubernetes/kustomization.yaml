@@ -5,7 +5,7 @@ namespace: chris-streaming
 
 resources:
   - 00-namespace.yaml
-  - 20-infra/opensearch.yaml
+  - 20-infra/quickwit.yaml
   - 20-infra/redis.yaml
   - 20-infra/postgres.yaml
   - 30-pfcon/pfcon-rbac.yaml
@@ -22,10 +22,6 @@ resources:
   - 50-ui/test-ui.yaml
 
 configMapGenerator:
-  - name: opensearch-index-template
-    namespace: chris-streaming
-    files:
-      - ../config/opensearch/index-template.json
   - name: init-test-data-script
     namespace: chris-streaming
     files:

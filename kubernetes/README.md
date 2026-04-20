@@ -1,7 +1,7 @@
 # Kubernetes deployment
 
 This directory contains Kubernetes manifests that bring up the same stack
-`docker-compose.yml` defines (Redis + OpenSearch + PostgreSQL + pfcon +
+`docker-compose.yml` defines (Redis + Quickwit + PostgreSQL + pfcon +
 streaming workers + SSE + test UI) on a local Kubernetes cluster. Tested on
 Docker Desktop's built-in K8s.
 
@@ -69,7 +69,7 @@ destroyed per invocation.
 # Unit tests — no infrastructure needed (fast)
 just k8s-run unit-tests
 
-# Integration tests — spins up an ephemeral Kafka/Redis/OpenSearch/Postgres
+# Integration tests — spins up an ephemeral Redis/Quickwit/Postgres
 # stack in the chris-streaming-test namespace, then tears it down
 just k8s-run integration-tests
 
@@ -127,7 +127,7 @@ All four workers share the same stream topology via env:
 - `stream:job-status:{0..N}` — status events (Event Forwarder → Status
   Consumer → Celery task → PostgreSQL + Pub/Sub).
 - `stream:job-logs:{0..N}` — container log lines (Log Forwarder → Log
-  Consumer → OpenSearch + Pub/Sub), plus `eos=true` markers on each
+  Consumer → Quickwit + Pub/Sub), plus `eos=true` markers on each
   container's final log entry.
 
 Shard count, consumer group names, batch sizes, and reclaim/lease TTLs

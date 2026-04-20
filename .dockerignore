@@ -8,7 +8,8 @@ __pycache__/
 .idea/
 .vscode/
 .claude/
-tests/
-config/
 test_ui/
+# Exclude everything under config/ except files the images actually need.
+config/*
+!config/quickwit/
 *.md

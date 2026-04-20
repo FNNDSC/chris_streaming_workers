@@ -48,8 +48,10 @@ spec:
               value: "8080"
             - name: REDIS_URL
               value: redis://redis:6379/0
-            - name: OPENSEARCH_URL
-              value: http://opensearch:9200
+            - name: QUICKWIT_URL
+              value: http://quickwit:7280
+            - name: QUICKWIT_INDEX
+              value: job-logs
             - name: CELERY_BROKER_URL
               value: redis://redis:6379/0
             - name: DB_DSN

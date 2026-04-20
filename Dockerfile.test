@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir ".[all,dev]"
 
 COPY chris_streaming/ chris_streaming/
 COPY tests/ tests/
+COPY config/quickwit/ config/quickwit/
 
 ENTRYPOINT ["pytest"]
 CMD ["-v", "--tb=short"]

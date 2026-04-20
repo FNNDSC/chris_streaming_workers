@@ -9,7 +9,7 @@ This test exercises the complete system:
       → pfcon schedule_copy → Docker container
         → Event Forwarder → Redis Streams → Status Consumer → Celery process_job_status
           → PostgreSQL upsert + Redis Pub/Sub
-        → Log Forwarder → Redis Streams → Log Consumer → OpenSearch + Redis Pub/Sub
+        → Log Forwarder → Redis Streams → Log Consumer → Quickwit + Redis Pub/Sub
       → workflow state machine: copy → plugin → upload → delete → cleanup
     → SSE Service streams events via /events/{id}/status and /events/{id}/logs
 
@@ -237,7 +237,7 @@ class TestWorkflowE2E:
             f"Expected 'plugin' in job types, got: {job_types_in_history}"
         )
 
-        # ── Step 5: Verify log history in OpenSearch ──────────────────────
+        # ── Step 5: Verify log history in Quickwit ───────────────────────
         #
         # The plugin (pl-simpledsapp) produces stdout output. After the
         # workflow completes and logs are flushed, they should be queryable.
@@ -256,7 +256,7 @@ class TestWorkflowE2E:
                 await asyncio.sleep(HISTORY_POLL_INTERVAL)
 
         assert len(log_lines) > 0, (
-            f"No log lines found in OpenSearch for {job_id}"
+            f"No log lines found in Quickwit for {job_id}"
         )
 
     async def test_sse_all_stream_receives_both_status_and_logs(

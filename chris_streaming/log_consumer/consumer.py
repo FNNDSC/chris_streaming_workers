@@ -1,8 +1,9 @@
 """
 Redis Streams consumer for the job-logs streams.
 
-Reads log events in batches from all N shards, writes to OpenSearch via the
-_bulk API, and publishes to Redis Pub/Sub for real-time streaming.
+Reads log events in batches from all N shards, writes to Quickwit via the
+ingest API (commit=force), and publishes to Redis Pub/Sub for real-time
+streaming.
 
 Unlike the status pipeline, logs tolerate loss of per-job ordering across
 reorderings, so we use the standard consumer-group pattern (no shard
@@ -10,8 +11,9 @@ leases): every replica runs M tasks (one per shard) in the same consumer
 group, and Redis load-balances entries across replicas.
 
 Batching: messages accumulate up to batch_max_size or batch_max_wait_seconds
-before being flushed to OpenSearch. Entries are XACK'd after a successful
-OpenSearch write (at-least-once semantics).
+before being flushed to Quickwit. Entries are XACK'd after a successful
+Quickwit write (at-least-once semantics). Entries left in the PEL by a
+failed flush or a crashed replica are recovered by ``PendingReclaimer``.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from redis.exceptions import ResponseError
 
 from chris_streaming.common.redis_stream import ShardRouter
 from chris_streaming.common.schemas import LogEvent
-from .opensearch_writer import OpenSearchWriter
+from .quickwit_writer import QuickwitWriter
 from .redis_publisher import LogRedisPublisher
 
 logger = logging.getLogger(__name__)
@@ -49,7 +51,7 @@ class LogEventConsumer:
         num_shards: int,
         group_name: str,
         consumer_name: str,
-        opensearch: OpenSearchWriter,
+        quickwit: QuickwitWriter,
         redis_pub: LogRedisPublisher,
         batch_max_size: int = 200,
         batch_max_wait_seconds: float = 2.0,
@@ -60,7 +62,7 @@ class LogEventConsumer:
         self._router = ShardRouter(num_shards)
         self._group = group_name
         self._consumer_name = consumer_name
-        self._opensearch = opensearch
+        self._quickwit = quickwit
         self._redis_pub = redis_pub
         self._batch_max_size = batch_max_size
         self._batch_max_wait = batch_max_wait_seconds
@@ -88,7 +90,7 @@ class LogEventConsumer:
           1. XREADGROUP across all shards (BLOCK = batch_max_wait_seconds).
           2. Deserialize log events and EOS markers.
           3. When batch_max_size or batch_max_wait_seconds is reached, flush
-             to OpenSearch + publish to Redis Pub/Sub + XACK consumed IDs.
+             to Quickwit + publish to Redis Pub/Sub + XACK consumed IDs.
         """
         self._running = True
         streams = {
@@ -150,14 +152,14 @@ class LogEventConsumer:
                 last_flush = time.monotonic()
 
     async def _flush_pending(self, pending: list[_PendingEntry]) -> None:
-        """Flush accumulated entries to OpenSearch + Pub/Sub, then XACK.
+        """Flush accumulated entries to Quickwit + Pub/Sub, then XACK.
 
-        EOS markers are filtered out of the OpenSearch write (they are not
+        EOS markers are filtered out of the Quickwit write (they are not
         log lines). After a successful flush, for each EOS marker we SET
         ``job:{job_id}:{job_type}:logs_flushed`` in Redis (TTL 1h) so
         ``cleanup_containers`` knows the container's logs are durable.
 
-        EOS signalling happens *after* the OpenSearch write so the key
+        EOS signalling happens *after* the Quickwit write so the key
         cannot race ahead of the data it attests to.
         """
         real = [p for p in pending if not p.event.eos]
@@ -198,13 +200,49 @@ class LogEventConsumer:
             logger.info("Signalled logs_flushed for %d EOS markers", len(eos))
 
     async def _flush(self, batch: list[LogEvent]) -> None:
-        """Write batch to OpenSearch and publish to Redis. Raises on OS failure."""
-        await self._opensearch.write_batch(batch)
+        """Write batch to Quickwit and publish to Redis. Raises on ingest failure."""
+        await self._quickwit.write_batch(batch)
         try:
             await self._redis_pub.publish_batch(batch)
         except Exception as e:
             logger.warning("Redis publish failed (%d events): %s", len(batch), e)
         logger.info("Flushed batch of %d log events", len(batch))
+
+    async def reclaim(self, raw_bytes: bytes) -> bool:
+        """Redeliver a single PEL entry claimed by ``PendingReclaimer``.
+
+        Mirrors ``_flush_pending`` semantics for a batch of one:
+
+        * Real log line → Quickwit ingest + Pub/Sub publish. Return True so
+          the reclaimer XACKs.
+        * EOS marker → SET ``logs_flushed`` key, return True.
+        * Ingest failure → return False; the reclaimer leaves the entry in
+          the PEL, and it will be re-examined on the next sweep. Once
+          ``times_delivered >= max_deliveries`` the reclaimer routes it to
+          the DLQ.
+        """
+        try:
+            event = LogEvent.deserialize(raw_bytes)
+        except Exception as e:
+            logger.error("Reclaim: failed to deserialize log: %s", e)
+            # Malformed payload — XACK so it doesn't pile up.
+            return True
+
+        if event.eos:
+            key = f"job:{event.job_id}:{event.job_type.value}:logs_flushed"
+            try:
+                await self._redis.set(key, "1", ex=3600)
+            except Exception as e:
+                logger.warning("Reclaim: failed to SET %s: %s", key, e)
+                return False
+            return True
+
+        try:
+            await self._flush([event])
+        except Exception as e:
+            logger.warning("Reclaim: ingest failed for job=%s: %s", event.job_id, e)
+            return False
+        return True
 
     async def stop(self) -> None:
         self._running = False

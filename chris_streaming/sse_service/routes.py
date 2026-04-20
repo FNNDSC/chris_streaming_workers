@@ -5,7 +5,7 @@ Endpoints:
   GET  /events/{job_id}/status   - SSE stream of status changes (with historical replay)
   GET  /events/{job_id}/logs     - SSE stream of log lines (with historical replay)
   GET  /events/{job_id}/all      - SSE stream of both interleaved (with historical replay)
-  GET  /logs/{job_id}/history    - JSON historical logs from OpenSearch
+  GET  /logs/{job_id}/history    - JSON historical logs from Quickwit
   POST /api/jobs/{job_id}/run    - Submit a workflow (async via Celery)
   GET  /api/jobs/{job_id}/workflow - Workflow status
   GET  /api/jobs/{job_id}/status/history - Historical status from PostgreSQL
@@ -21,10 +21,10 @@ from typing import Optional
 
 import psycopg2
 from fastapi import APIRouter, Request
-from opensearchpy import AsyncOpenSearch
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from chris_streaming.common.quickwit import QuickwitClient
 from chris_streaming.common.settings import SSEServiceSettings
 from chris_streaming.common.redis_stream import create_redis_client
 from chris_streaming.common.stream_metrics import collect_stream_metrics
@@ -68,8 +68,8 @@ async def _event_generator(request: Request, job_id: str, event_type: str):
         job_id=job_id,
         event_type=event_type,
         db_dsn=settings.db_dsn,
-        opensearch_url=settings.opensearch_url,
-        opensearch_index_prefix=settings.opensearch_index_prefix,
+        quickwit_url=settings.quickwit_url,
+        quickwit_index=settings.quickwit_index,
     ):
         if await request.is_disconnected():
             break
@@ -99,24 +99,18 @@ async def stream_all(request: Request, job_id: str):
 
 @router.get("/logs/{job_id}/history")
 async def get_log_history(job_id: str, limit: int = 1000, offset: int = 0):
-    """Retrieve historical logs for a job from OpenSearch."""
+    """Retrieve historical logs for a job from Quickwit."""
     settings = _get_settings()
-    client = AsyncOpenSearch(hosts=[settings.opensearch_url], use_ssl=False, verify_certs=False)
-
+    client = QuickwitClient(settings.quickwit_url, index_id=settings.quickwit_index)
+    await client.connect()
     try:
-        index_pattern = f"{settings.opensearch_index_prefix}-*"
-        body = {
-            "query": {"term": {"job_id": job_id}},
-            "sort": [{"timestamp": {"order": "asc"}}],
-            "from": offset,
-            "size": limit,
+        result = await client.search_by_job(job_id, limit=limit, offset=offset)
+        return {
+            "job_id": job_id,
+            "total": result["total"],
+            "offset": offset,
+            "lines": result["lines"],
         }
-        resp = await client.search(index=index_pattern, body=body)
-        hits = resp.get("hits", {})
-        total = hits.get("total", {}).get("value", 0)
-        lines = [hit["_source"] for hit in hits.get("hits", [])]
-
-        return {"job_id": job_id, "total": total, "offset": offset, "lines": lines}
     finally:
         await client.close()
 

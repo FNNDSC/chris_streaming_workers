@@ -71,8 +71,8 @@ class StatusConsumerSettings(RedisStreamsSettings):
 class LogConsumerSettings(RedisStreamsSettings):
     """Log Consumer specific settings."""
     log_consumer_group: str = "log-consumer-group"
-    opensearch_url: str = "http://opensearch:9200"
-    opensearch_index_prefix: str = "job-logs"
+    quickwit_url: str = "http://quickwit:7280"
+    quickwit_index: str = "job-logs"
     # Batching: flush after this many messages or this many seconds
     batch_max_size: int = 200
     batch_max_wait_seconds: float = 2.0
@@ -91,8 +91,8 @@ class SSEServiceSettings(RedisStreamsSettings):
     """SSE Service and Celery Worker settings."""
     host: str = "0.0.0.0"
     port: int = 8080
-    opensearch_url: str = "http://opensearch:9200"
-    opensearch_index_prefix: str = "job-logs"
+    quickwit_url: str = "http://quickwit:7280"
+    quickwit_index: str = "job-logs"
     celery_broker_url: str = "redis://redis:6379/0"
     db_dsn: str = "postgresql://chris:chris1234@postgres:5432/chris_streaming"
     # pfcon connection (used by Celery worker for workflow orchestration)

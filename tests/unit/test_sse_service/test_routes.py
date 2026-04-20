@@ -132,19 +132,18 @@ class TestGetStatusHistory:
 
 class TestGetLogHistory:
     async def test_returns_logs(self, app):
-        mock_os_resp = {
-            "hits": {
-                "total": {"value": 1},
-                "hits": [
-                    {"_source": {"job_id": "j1", "line": "hello", "timestamp": "2026-01-15T12:00:00"}}
-                ],
-            }
+        search_result = {
+            "total": 1,
+            "lines": [
+                {"job_id": "j1", "line": "hello", "timestamp": "2026-01-15T12:00:00"}
+            ],
         }
-        with patch("chris_streaming.sse_service.routes.AsyncOpenSearch") as MockOS:
+        with patch("chris_streaming.sse_service.routes.QuickwitClient") as MockQW:
             mock_client = AsyncMock()
-            mock_client.search = AsyncMock(return_value=mock_os_resp)
+            mock_client.connect = AsyncMock()
+            mock_client.search_by_job = AsyncMock(return_value=search_result)
             mock_client.close = AsyncMock()
-            MockOS.return_value = mock_client
+            MockQW.return_value = mock_client
 
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -154,3 +153,7 @@ class TestGetLogHistory:
             data = resp.json()
             assert data["total"] == 1
             assert data["lines"][0]["line"] == "hello"
+            mock_client.search_by_job.assert_awaited_once_with(
+                "j1", limit=1000, offset=0,
+            )
+            mock_client.close.assert_awaited_once()

@@ -2,7 +2,7 @@
 Async Redis Pub/Sub subscriber for SSE connections with historical replay.
 
 When a client connects, historical data is replayed from PostgreSQL (status)
-and OpenSearch (logs) before switching to live Redis Pub/Sub events. This
+and Quickwit (logs) before switching to live Redis Pub/Sub events. This
 ensures late-connecting clients receive the full event history.
 """
 
@@ -16,7 +16,8 @@ from typing import Literal
 
 import psycopg2
 import redis.asyncio as aioredis
-from opensearchpy import AsyncOpenSearch
+
+from chris_streaming.common.quickwit import QuickwitClient, QuickwitSearchError
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +27,14 @@ async def subscribe_to_job(
     job_id: str,
     event_type: Literal["status", "logs", "all"] = "all",
     db_dsn: str = "",
-    opensearch_url: str = "",
-    opensearch_index_prefix: str = "job-logs",
+    quickwit_url: str = "",
+    quickwit_index: str = "job-logs",
 ) -> AsyncIterator[dict]:
     """
     Async generator that yields events for a job.
 
     1. Subscribe to Redis Pub/Sub first (buffer live messages)
-    2. Replay historical data from PostgreSQL (status) and OpenSearch (logs)
+    2. Replay historical data from PostgreSQL (status) and Quickwit (logs)
     3. Yield historical events, then switch to live events
     4. Deduplicate overlapping events by event_id
 
@@ -72,9 +73,9 @@ async def subscribe_to_job(
                     seen_event_ids.add(event_id)
                 yield data
 
-        if event_type in ("logs", "all") and opensearch_url:
+        if event_type in ("logs", "all") and quickwit_url:
             async for data in _replay_log_history(
-                opensearch_url, opensearch_index_prefix, job_id
+                quickwit_url, quickwit_index, job_id
             ):
                 event_id = data.get("event_id", "")
                 if event_id:
@@ -176,23 +177,18 @@ def _fetch_status_rows(db_dsn: str, job_id: str) -> list[dict]:
 
 
 async def _replay_log_history(
-    opensearch_url: str, index_prefix: str, job_id: str
+    quickwit_url: str, index_id: str, job_id: str
 ) -> AsyncIterator[dict]:
-    """Query OpenSearch for historical log records and yield them."""
-    client = AsyncOpenSearch(hosts=[opensearch_url], use_ssl=False, verify_certs=False)
+    """Query Quickwit for historical log records and yield them."""
+    client = QuickwitClient(quickwit_url, index_id=index_id)
     try:
-        index_pattern = f"{index_prefix}-*"
-        body = {
-            "query": {"term": {"job_id": job_id}},
-            "sort": [{"timestamp": {"order": "asc"}}],
-            "size": 5000,
-        }
-        resp = await client.search(index=index_pattern, body=body)
-        hits = resp.get("hits", {}).get("hits", [])
-        for hit in hits:
-            data = hit["_source"]
-            data["_event_type"] = "logs"
-            yield data
+        await client.connect()
+        result = await client.search_by_job(job_id, limit=5000)
+        for doc in result.get("lines", []):
+            doc["_event_type"] = "logs"
+            yield doc
+    except QuickwitSearchError as e:
+        logger.warning("Failed to fetch log history for replay: %s", e)
     except Exception as e:
         logger.warning("Failed to fetch log history for replay: %s", e)
     finally:

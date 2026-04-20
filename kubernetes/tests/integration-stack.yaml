@@ -1,5 +1,5 @@
 # Integration test infrastructure in chris-streaming-test namespace.
-# Standalone copy of redis/opensearch/postgres — no PVCs (ephemeral).
+# Standalone copy of redis/quickwit/postgres — no PVCs (ephemeral).
 ---
 apiVersion: v1
 kind: Service
@@ -50,52 +50,51 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: opensearch
+  name: quickwit
   namespace: chris-streaming-test
   labels:
-    app: opensearch
+    app: quickwit
 spec:
   selector:
-    app: opensearch
+    app: quickwit
   ports:
-    - port: 9200
-      targetPort: 9200
+    - port: 7280
+      targetPort: 7280
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: opensearch
+  name: quickwit
   namespace: chris-streaming-test
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: opensearch
+      app: quickwit
   template:
     metadata:
       labels:
-        app: opensearch
+        app: quickwit
     spec:
       containers:
-        - name: opensearch
-          image: opensearchproject/opensearch:2.18.0
+        - name: quickwit
+          image: quickwit/quickwit:latest
+          args: ["run"]
           env:
-            - name: discovery.type
-              value: single-node
-            - name: DISABLE_SECURITY_PLUGIN
-              value: "true"
-            - name: OPENSEARCH_JAVA_OPTS
-              value: "-Xms256m -Xmx256m"
+            - name: QW_METASTORE_URI
+              value: "file:///quickwit/qwdata/metastore"
+            - name: QW_DEFAULT_INDEX_ROOT_URI
+              value: "file:///quickwit/qwdata/indexes"
           ports:
-            - containerPort: 9200
+            - containerPort: 7280
           readinessProbe:
             httpGet:
-              path: /_cluster/health
-              port: 9200
-            initialDelaySeconds: 30
-            periodSeconds: 10
+              path: /health/livez
+              port: 7280
+            initialDelaySeconds: 10
+            periodSeconds: 5
             timeoutSeconds: 5
-            failureThreshold: 20
+            failureThreshold: 30
 ---
 apiVersion: v1
 kind: Secret

@@ -56,7 +56,8 @@ class TestLogConsumerSettings:
         s = LogConsumerSettings()
         assert s.redis_url == "redis://redis:6379/0"
         assert s.stream_logs_base == "stream:job-logs"
-        assert s.opensearch_url == "http://opensearch:9200"
+        assert s.quickwit_url == "http://quickwit:7280"
+        assert s.quickwit_index == "job-logs"
         assert s.batch_max_size == 200
         assert s.batch_max_wait_seconds == 2.0
 

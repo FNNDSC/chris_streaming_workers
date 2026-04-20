@@ -6,6 +6,7 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir ".[sse-service]"
 
 COPY chris_streaming/ chris_streaming/
+COPY config/quickwit/ config/quickwit/
 
 EXPOSE 8080
 

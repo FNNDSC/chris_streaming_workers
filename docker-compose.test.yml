@@ -5,7 +5,7 @@
 #   Unit tests (no infra):
 #     docker compose -f docker-compose.test.yml run --rm unit-tests
 #
-#   Integration tests (Redis, OpenSearch, PostgreSQL):
+#   Integration tests (Redis, Quickwit, PostgreSQL):
 #     docker compose -f docker-compose.test.yml --profile integration up -d --wait
 #     docker compose -f docker-compose.test.yml run --rm integration-tests
 #     docker compose -f docker-compose.test.yml --profile integration down
@@ -34,12 +34,12 @@ services:
     command: ["-v", "--tb=short", "-m", "integration", "tests/"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      OPENSEARCH_URL: http://opensearch:9200
+      QUICKWIT_URL: http://quickwit:7280
       DB_DSN: postgresql://chris:chris1234@postgres:5432/chris_streaming_test
     depends_on:
       redis:
         condition: service_healthy
-      opensearch:
+      quickwit:
         condition: service_healthy
       postgres:
         condition: service_healthy
@@ -56,7 +56,7 @@ services:
       SSE_SERVICE_URL: http://sse-service:8080
       PFCON_URL: http://pfcon:30005
       REDIS_URL: redis://redis:6379/0
-      OPENSEARCH_URL: http://opensearch:9200
+      QUICKWIT_URL: http://quickwit:7280
       DB_DSN: postgresql://chris:chris1234@postgres:5432/chris_streaming
     networks:
       - streaming
@@ -80,17 +80,17 @@ services:
       timeout: 3s
       retries: 10
 
-  opensearch:
-    image: opensearchproject/opensearch:2.18.0
+  quickwit:
+    image: quickwit/quickwit:latest
     profiles: ["integration"]
+    command: ["run"]
     environment:
-      discovery.type: single-node
-      DISABLE_SECURITY_PLUGIN: "true"
-      OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+      QW_METASTORE_URI: "file:///quickwit/qwdata/metastore"
+      QW_DEFAULT_INDEX_ROOT_URI: "file:///quickwit/qwdata/indexes"
     networks:
       - test
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:7280/health/livez >/dev/null 2>&1 || curl -sf http://localhost:7280/health/livez || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 20

@@ -23,7 +23,7 @@ status-consumer = [
 ]
 log-consumer = [
     "redis[hiredis]>=5.2,<6",
-    "opensearch-py[async]>=2.7,<3",
+    "httpx>=0.27,<1",
     "structlog>=24.4,<26",
 ]
 log-forwarder = [
@@ -38,7 +38,7 @@ sse-service = [
     "sse-starlette>=2.2,<3",
     "redis[hiredis]>=5.2,<6",
     "celery[redis]>=5.4,<6",
-    "opensearch-py[async]>=2.7,<3",
+    "httpx>=0.27,<1",
     "psycopg2-binary>=2.9,<3",
     "requests>=2.31,<3",
 ]

@@ -116,7 +116,7 @@ k8s-up: k8s-build
     for dep in pfcon sse-service celery-worker event-forwarder status-consumer log-consumer log-forwarder redis test-ui; do
         kubectl rollout status deployment/$dep -n {{ k8s_ns }} --timeout=180s
     done
-    for sts in opensearch postgres; do
+    for sts in quickwit postgres; do
         kubectl rollout status statefulset/$sts -n {{ k8s_ns }} --timeout=180s
     done
     echo
@@ -188,7 +188,7 @@ k8s-run target="unit-tests":
         just k8s-build
         kubectl kustomize --load-restrictor=LoadRestrictionsNone kubernetes/tests/ | kubectl apply -f -
         echo "Waiting for integration stack..."
-        for dep in redis opensearch postgres; do
+        for dep in redis quickwit postgres; do
             kubectl rollout status deployment/$dep -n {{ k8s_test_ns }} --timeout=180s
         done
         run_job {{ k8s_test_ns }} kubernetes/tests/integration-tests-job.yaml integration-tests 900s

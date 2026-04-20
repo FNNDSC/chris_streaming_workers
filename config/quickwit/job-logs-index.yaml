@@ -1,0 +1,45 @@
+version: 0.8
+
+index_id: job-logs
+
+doc_mapping:
+  timestamp_field: timestamp
+  field_mappings:
+    - name: event_id
+      type: text
+      tokenizer: raw
+      fast: false
+    - name: job_id
+      type: text
+      tokenizer: raw
+      fast: true
+    - name: job_type
+      type: text
+      tokenizer: raw
+    - name: container_name
+      type: text
+      tokenizer: raw
+    - name: stream
+      type: text
+      tokenizer: raw
+    - name: eos
+      type: bool
+    - name: line
+      type: text
+      tokenizer: default
+      record: position
+    - name: timestamp
+      type: datetime
+      fast: true
+      input_formats:
+        - rfc3339
+        - unix_timestamp
+      output_format: rfc3339
+      fast_precision: seconds
+
+indexing_settings:
+  commit_timeout_secs: 10
+
+retention:
+  period: 90 days
+  schedule: daily
