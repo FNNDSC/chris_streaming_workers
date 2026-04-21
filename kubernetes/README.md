@@ -125,10 +125,16 @@ env to a `redis+sentinel://` URL pointing at the Sentinel service.
 All four workers share the same stream topology via env:
 
 - `stream:job-status:{0..N}` — status events (Event Forwarder → Status
-  Consumer → Celery task → PostgreSQL + Pub/Sub).
+  Consumer → Celery task → PostgreSQL; Celery re-emits `confirmed_*`
+  via XADD back to the same stream).
 - `stream:job-logs:{0..N}` — container log lines (Log Forwarder → Log
-  Consumer → Quickwit + Pub/Sub), plus `eos=true` markers on each
-  container's final log entry.
+  Consumer → Quickwit), plus `eos=true` markers on each container's
+  final log entry.
+- `stream:job-workflow:{0..N}` — workflow transitions (Celery task →
+  `job_workflow_events` row + XADD).
+
+The SSE service fans out to browsers via ungrouped `XREAD` on all three
+bases simultaneously — there is no separate Pub/Sub plane.
 
 Shard count, consumer group names, batch sizes, and reclaim/lease TTLs
 are read from env at pod startup — see the main [README.md](../README.md)

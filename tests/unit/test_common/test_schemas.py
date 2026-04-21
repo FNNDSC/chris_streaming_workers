@@ -9,6 +9,7 @@ from chris_streaming.common.schemas import (
     JobType,
     LogEvent,
     StatusEvent,
+    WorkflowEvent,
 )
 
 
@@ -210,5 +211,58 @@ class TestLogEvent:
         )
         restored = LogEvent.deserialize(original.serialize())
         assert restored.event_id == original.event_id
+
+
+# ── WorkflowEvent ─────────────────────────────────────────────────────────
+
+class TestWorkflowEvent:
+    def test_auto_event_id(self):
+        event = WorkflowEvent(
+            job_id="j1",
+            current_step="plugin",
+            current_step_status="started",
+            workflow_status="running",
+        )
+        assert len(event.event_id) == 24
+
+    def test_event_id_deterministic_excludes_timestamp(self):
+        """event_id must be stable across retries — timestamp differs but hash is fixed."""
+        e1 = WorkflowEvent(
+            job_id="j1", current_step="plugin",
+            current_step_status="started", workflow_status="running",
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        e2 = WorkflowEvent(
+            job_id="j1", current_step="plugin",
+            current_step_status="started", workflow_status="running",
+            timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        )
+        assert e1.event_id == e2.event_id
+
+    def test_event_id_differs_with_error(self):
+        e1 = WorkflowEvent(
+            job_id="j1", current_step="plugin",
+            current_step_status="started", workflow_status="running",
+        )
+        e2 = WorkflowEvent(
+            job_id="j1", current_step="plugin",
+            current_step_status="started", workflow_status="running",
+            error="boom",
+        )
+        assert e1.event_id != e2.event_id
+
+    def test_serialize_deserialize_roundtrip(self):
+        event = WorkflowEvent(
+            job_id="j1",
+            current_step="plugin",
+            current_step_status="finishedSuccessfully",
+            workflow_status="running",
+        )
+        restored = WorkflowEvent.deserialize(event.serialize())
+        assert restored.event_id == event.event_id
+        assert restored.current_step == "plugin"
+        assert restored.current_step_status == "finishedSuccessfully"
+        assert restored.workflow_status == "running"
+        assert restored.error is None
 
 

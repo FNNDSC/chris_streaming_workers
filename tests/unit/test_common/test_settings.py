@@ -21,6 +21,7 @@ class TestRedisStreamsSettings:
         s = RedisStreamsSettings()
         assert s.stream_status_base == "stream:job-status"
         assert s.stream_logs_base == "stream:job-logs"
+        assert s.stream_workflow_base == "stream:job-workflow"
         assert s.stream_status_dlq == "stream:job-status-dlq"
         assert s.stream_logs_dlq == "stream:job-logs-dlq"
         assert s.stream_num_shards == 8

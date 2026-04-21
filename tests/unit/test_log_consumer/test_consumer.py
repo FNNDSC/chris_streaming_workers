@@ -11,7 +11,6 @@ class TestLogEventConsumer:
     def _make_consumer(self):
         mock_redis = AsyncMock()
         mock_qw = AsyncMock()
-        mock_redis_pub = AsyncMock()
         consumer = LogEventConsumer(
             redis=mock_redis,
             base_stream="stream:job-logs",
@@ -19,37 +18,28 @@ class TestLogEventConsumer:
             group_name="log-consumer-group",
             consumer_name="test-consumer",
             quickwit=mock_qw,
-            redis_pub=mock_redis_pub,
             batch_max_size=5,
             batch_max_wait_seconds=0.1,
         )
-        return consumer, mock_redis, mock_qw, mock_redis_pub
+        return consumer, mock_redis, mock_qw
 
-    async def test_flush_writes_to_quickwit_and_redis(self, sample_log_event):
-        consumer, _, mock_qw, mock_redis_pub = self._make_consumer()
+    async def test_flush_writes_to_quickwit(self, sample_log_event):
+        consumer, _, mock_qw = self._make_consumer()
         batch = [sample_log_event]
 
         await consumer._flush(batch)
 
         mock_qw.write_batch.assert_awaited_once_with(batch)
-        mock_redis_pub.publish_batch.assert_awaited_once_with(batch)
-
-    async def test_flush_redis_failure_does_not_raise(self, sample_log_event):
-        consumer, _, mock_qw, mock_redis_pub = self._make_consumer()
-        mock_redis_pub.publish_batch = AsyncMock(side_effect=Exception("Redis down"))
-
-        await consumer._flush([sample_log_event])
-        mock_qw.write_batch.assert_awaited_once()
 
     async def test_flush_quickwit_failure_raises(self, sample_log_event):
-        consumer, _, mock_qw, _ = self._make_consumer()
+        consumer, _, mock_qw = self._make_consumer()
         mock_qw.write_batch = AsyncMock(side_effect=Exception("QW down"))
 
         with pytest.raises(Exception, match="QW down"):
             await consumer._flush([sample_log_event])
 
     async def test_flush_pending_acks_after_success(self, sample_log_event):
-        consumer, mock_redis, mock_qw, mock_redis_pub = self._make_consumer()
+        consumer, mock_redis, mock_qw = self._make_consumer()
         pending = [
             _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
             _PendingEntry(stream="stream:job-logs:0", entry_id="2-0", event=sample_log_event),
@@ -58,7 +48,6 @@ class TestLogEventConsumer:
         await consumer._flush_pending(pending)
 
         mock_qw.write_batch.assert_awaited_once()
-        mock_redis_pub.publish_batch.assert_awaited_once()
         mock_redis.xack.assert_awaited_once_with(
             "stream:job-logs:0", "log-consumer-group", "1-0", "2-0",
         )
@@ -66,7 +55,7 @@ class TestLogEventConsumer:
     async def test_flush_pending_skips_ack_on_quickwit_failure(
         self, sample_log_event
     ):
-        consumer, mock_redis, mock_qw, _ = self._make_consumer()
+        consumer, mock_redis, mock_qw = self._make_consumer()
         mock_qw.write_batch = AsyncMock(side_effect=Exception("QW down"))
         pending = [
             _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
@@ -79,7 +68,7 @@ class TestLogEventConsumer:
     async def test_flush_pending_sets_logs_flushed_on_eos_only_batch(
         self, eos_log_event
     ):
-        consumer, mock_redis, mock_qw, _ = self._make_consumer()
+        consumer, mock_redis, mock_qw = self._make_consumer()
         pending = [
             _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=eos_log_event),
         ]
@@ -102,7 +91,7 @@ class TestLogEventConsumer:
     async def test_flush_pending_sets_logs_flushed_after_mixed_batch_flush(
         self, sample_log_event, eos_log_event
     ):
-        consumer, mock_redis, mock_qw, _ = self._make_consumer()
+        consumer, mock_redis, mock_qw = self._make_consumer()
         pending = [
             _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
             _PendingEntry(stream="stream:job-logs:0", entry_id="2-0", event=eos_log_event),
@@ -124,7 +113,7 @@ class TestLogEventConsumer:
         self, sample_log_event, eos_log_event
     ):
         """If Quickwit write fails, EOS must NOT fire logs_flushed yet."""
-        consumer, mock_redis, mock_qw, _ = self._make_consumer()
+        consumer, mock_redis, mock_qw = self._make_consumer()
         mock_qw.write_batch = AsyncMock(side_effect=Exception("QW down"))
         pending = [
             _PendingEntry(stream="stream:job-logs:0", entry_id="1-0", event=sample_log_event),
@@ -137,7 +126,7 @@ class TestLogEventConsumer:
         mock_redis.xack.assert_not_awaited()
 
     async def test_close_stops_loop(self):
-        consumer, _, _, _ = self._make_consumer()
+        consumer, _, _ = self._make_consumer()
         consumer._running = True
         await consumer.close()
         assert consumer._running is False

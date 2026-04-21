@@ -19,5 +19,6 @@ class TestCreateApp:
         assert "/health" in route_paths
         assert "/events/{job_id}/status" in route_paths
         assert "/events/{job_id}/logs" in route_paths
+        assert "/events/{job_id}/workflow" in route_paths
         assert "/events/{job_id}/all" in route_paths
         assert "/api/jobs/{job_id}/run" in route_paths

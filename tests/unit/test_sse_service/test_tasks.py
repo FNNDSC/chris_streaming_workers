@@ -4,102 +4,82 @@ import json
 from unittest.mock import MagicMock, patch
 
 
-# We need to mock the DB and Redis pools before importing the tasks module
-# since it initializes them at module level via worker signals.
+def _make_event_data(**overrides):
+    defaults = {
+        "job_id": "test-job-1",
+        "job_type": "plugin",
+        "status": "started",
+        "image": "img:latest",
+        "cmd": "python app.py",
+        "message": "start",
+        "exit_code": None,
+        "source": "docker",
+        "event_id": "abc123",
+        "timestamp": "2026-01-15T12:00:00+00:00",
+    }
+    defaults.update(overrides)
+    return defaults
+
+
+def _mock_db(mock_db_ctx):
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
+    mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+    mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
+    return mock_conn, mock_cur
 
 
 class TestProcessJobStatus:
-    def _make_event_data(self, **overrides):
-        defaults = {
-            "job_id": "test-job-1",
-            "job_type": "plugin",
-            "status": "started",
-            "image": "img:latest",
-            "cmd": "python app.py",
-            "message": "start",
-            "exit_code": None,
-            "source": "docker",
-            "event_id": "abc123",
-            "timestamp": "2026-01-15T12:00:00+00:00",
-        }
-        defaults.update(overrides)
-        return defaults
-
     @patch("chris_streaming.sse_service.tasks._try_advance_workflow")
     @patch("chris_streaming.sse_service.tasks._get_redis")
     @patch("chris_streaming.sse_service.tasks._get_db_conn")
-    def test_upserts_and_publishes(self, mock_db_ctx, mock_get_redis, mock_advance):
+    def test_non_terminal_upserts_only(self, mock_db_ctx, mock_get_redis, mock_advance):
+        """For a non-terminal event, we upsert but never XADD confirmed_*."""
         from chris_streaming.sse_service.tasks import process_job_status
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
-
+        mock_conn, mock_cur = _mock_db(mock_db_ctx)
         mock_redis = MagicMock()
         mock_get_redis.return_value = mock_redis
 
-        event_data = self._make_event_data()
-        result = process_job_status(event_data)
+        result = process_job_status(_make_event_data(status="started"))
 
         assert result["status"] == "processed"
         assert result["job_id"] == "test-job-1"
         assert result["db_upserted"] is True
+        assert result["confirmed"] is False
         mock_cur.execute.assert_called_once()
         mock_conn.commit.assert_called_once()
-        mock_redis.publish.assert_called_once()
+        mock_redis.xadd.assert_not_called()
+        mock_redis.publish.assert_not_called()
+        mock_advance.assert_not_called()
 
     @patch("chris_streaming.sse_service.tasks._try_advance_workflow")
     @patch("chris_streaming.sse_service.tasks._get_redis")
     @patch("chris_streaming.sse_service.tasks._get_db_conn")
-    def test_terminal_status_publishes_confirmed(self, mock_db_ctx, mock_get_redis, mock_advance):
+    def test_terminal_status_xadds_confirmed(self, mock_db_ctx, mock_get_redis, mock_advance):
+        """Terminal events XADD confirmed_* onto the sharded status stream."""
         from chris_streaming.sse_service.tasks import process_job_status
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
-
+        _mock_db(mock_db_ctx)
         mock_redis = MagicMock()
         mock_get_redis.return_value = mock_redis
 
-        event_data = self._make_event_data(status="finishedSuccessfully", exit_code=0)
-        result = process_job_status(event_data)
+        result = process_job_status(
+            _make_event_data(status="finishedSuccessfully", exit_code=0)
+        )
 
         assert result["confirmed"] is True
-        # Should have published twice: original + confirmed
-        assert mock_redis.publish.call_count == 2
-        # Check confirmed event
-        confirmed_call = mock_redis.publish.call_args_list[1]
-        confirmed_data = json.loads(confirmed_call[0][1])
-        assert confirmed_data["status"] == "confirmed_finishedSuccessfully"
-
-    @patch("chris_streaming.sse_service.tasks._try_advance_workflow")
-    @patch("chris_streaming.sse_service.tasks._get_redis")
-    @patch("chris_streaming.sse_service.tasks._get_db_conn")
-    def test_non_terminal_does_not_confirm(self, mock_db_ctx, mock_get_redis, mock_advance):
-        from chris_streaming.sse_service.tasks import process_job_status
-
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
-
-        mock_redis = MagicMock()
-        mock_get_redis.return_value = mock_redis
-
-        event_data = self._make_event_data(status="started")
-        result = process_job_status(event_data)
-
-        assert result["confirmed"] is False
-        mock_redis.publish.assert_called_once()
-        mock_advance.assert_not_called()
+        mock_redis.xadd.assert_called_once()
+        call = mock_redis.xadd.call_args
+        stream_key = call[0][0]
+        assert stream_key.startswith("stream:job-status:")
+        fields = call[0][1]
+        body = json.loads(fields["data"].decode("utf-8"))
+        assert body["status"] == "confirmed_finishedSuccessfully"
+        assert body["previous_status"] == "finishedSuccessfully"
+        assert body["job_id"] == "test-job-1"
 
     @patch("chris_streaming.sse_service.tasks._try_advance_workflow")
     @patch("chris_streaming.sse_service.tasks._get_redis")
@@ -109,20 +89,89 @@ class TestProcessJobStatus:
     ):
         from chris_streaming.sse_service.tasks import process_job_status
 
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        _mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
 
+        process_job_status(_make_event_data(status="finishedSuccessfully"))
+
+        mock_advance.assert_called_once_with(
+            "test-job-1", "plugin", "finishedSuccessfully",
+        )
+
+
+class TestPublishWorkflowEvent:
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_records_history_and_xadds_workflow_stream(
+        self, mock_db_ctx, mock_get_redis
+    ):
+        from chris_streaming.sse_service.tasks import _publish_workflow_event
+
+        mock_conn, mock_cur = _mock_db(mock_db_ctx)
         mock_redis = MagicMock()
         mock_get_redis.return_value = mock_redis
 
-        event_data = self._make_event_data(status="finishedSuccessfully")
-        process_job_status(event_data)
+        _publish_workflow_event("job-x", "plugin", "started", "running")
 
-        mock_advance.assert_called_once_with("test-job-1", "plugin", "finishedSuccessfully")
+        # Dedup insert into job_workflow_events with ON CONFLICT DO NOTHING.
+        insert_sql = mock_cur.execute.call_args[0][0]
+        assert "job_workflow_events" in insert_sql
+        assert "ON CONFLICT (event_id) DO NOTHING" in insert_sql
+        mock_conn.commit.assert_called_once()
+
+        # XADD to the sharded workflow stream, carrying the WorkflowEvent JSON.
+        mock_redis.xadd.assert_called_once()
+        stream_key = mock_redis.xadd.call_args[0][0]
+        assert stream_key.startswith("stream:job-workflow:")
+        fields = mock_redis.xadd.call_args[0][1]
+        body = json.loads(fields["data"].decode("utf-8"))
+        assert body["job_id"] == "job-x"
+        assert body["current_step"] == "plugin"
+        assert body["current_step_status"] == "started"
+        assert body["workflow_status"] == "running"
+        assert body["event_id"]
+
+        # No legacy Pub/Sub publish.
+        mock_redis.publish.assert_not_called()
+
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_error_field_included_in_payload_and_history(
+        self, mock_db_ctx, mock_get_redis
+    ):
+        from chris_streaming.sse_service.tasks import _publish_workflow_event
+
+        _, mock_cur = _mock_db(mock_db_ctx)
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+
+        _publish_workflow_event(
+            "job-x", "plugin", "finishedWithError", "running",
+            extra={"error": "oh no"},
+        )
+
+        insert_params = mock_cur.execute.call_args[0][1]
+        # (job_id, current_step, current_step_status, workflow_status, error, event_id)
+        assert insert_params[4] == "oh no"
+        body = json.loads(mock_redis.xadd.call_args[0][1]["data"].decode("utf-8"))
+        assert body["error"] == "oh no"
+
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_event_id_is_deterministic(self, mock_db_ctx, mock_get_redis):
+        """Two calls with identical args produce the same event_id (retry-safe)."""
+        from chris_streaming.sse_service.tasks import _publish_workflow_event
+
+        _mock_db(mock_db_ctx)
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+
+        _publish_workflow_event("job-x", "plugin", "started", "running")
+        _publish_workflow_event("job-x", "plugin", "started", "running")
+
+        first = json.loads(mock_redis.xadd.call_args_list[0][0][1]["data"].decode())
+        second = json.loads(mock_redis.xadd.call_args_list[1][0][1]["data"].decode())
+        assert first["event_id"] == second["event_id"]
 
 
 class TestConfirmedMap:
@@ -376,15 +425,6 @@ class TestTerminalWorkflowStatus:
 class TestStartWorkflowSkipLogic:
     """Tests that start_workflow honours pfcon's requires_*_job flags."""
 
-    def _mock_db(self, mock_db_ctx):
-        mock_conn = MagicMock()
-        mock_cur = MagicMock()
-        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
-        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
-        mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
-        mock_db_ctx.return_value.__exit__ = MagicMock(return_value=False)
-        return mock_conn, mock_cur
-
     @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
     @patch("chris_streaming.sse_service.tasks._pfcon")
     @patch("chris_streaming.sse_service.tasks._get_redis")
@@ -394,7 +434,7 @@ class TestStartWorkflowSkipLogic:
     ):
         from chris_streaming.sse_service.tasks import start_workflow
 
-        _, mock_cur = self._mock_db(mock_db_ctx)
+        _, mock_cur = _mock_db(mock_db_ctx)
         mock_get_redis.return_value = MagicMock()
         mock_pfcon.get_server_info.return_value = {
             "requires_copy_job": False,
@@ -403,9 +443,17 @@ class TestStartWorkflowSkipLogic:
 
         start_workflow("job-x", {"image": "img:1"})
 
-        # The initial step must be 'plugin', not 'copy'.
-        insert_call = mock_cur.execute.call_args_list[0]
-        insert_args = insert_call[0][1]
+        # The initial insert into job_workflow must land with current_step='plugin'.
+        workflow_inserts = [
+            call for call in mock_cur.execute.call_args_list
+            if "job_workflow " in call[0][0] or "job_workflow(" in call[0][0]
+            or call[0][0].strip().startswith("INSERT INTO job_workflow ")
+        ]
+        assert workflow_inserts, (
+            "expected an INSERT into job_workflow (got: "
+            f"{[c[0][0] for c in mock_cur.execute.call_args_list]})"
+        )
+        insert_args = workflow_inserts[0][0][1]
         assert insert_args[1] == "plugin"
         mock_execute.assert_called_once()
         assert mock_execute.call_args[0][1] == "plugin"
@@ -419,7 +467,7 @@ class TestStartWorkflowSkipLogic:
     ):
         from chris_streaming.sse_service.tasks import start_workflow
 
-        _, mock_cur = self._mock_db(mock_db_ctx)
+        _, mock_cur = _mock_db(mock_db_ctx)
         mock_get_redis.return_value = MagicMock()
         mock_pfcon.get_server_info.return_value = {
             "requires_copy_job": True,
@@ -428,8 +476,11 @@ class TestStartWorkflowSkipLogic:
 
         start_workflow("job-x", {"image": "img:1"})
 
-        insert_call = mock_cur.execute.call_args_list[0]
-        insert_args = insert_call[0][1]
+        workflow_inserts = [
+            c for c in mock_cur.execute.call_args_list
+            if c[0][0].strip().startswith("INSERT INTO job_workflow ")
+        ]
+        insert_args = workflow_inserts[0][0][1]
         assert insert_args[1] == "copy"
         assert mock_execute.call_args[0][1] == "copy"
 
@@ -442,7 +493,7 @@ class TestStartWorkflowSkipLogic:
     ):
         from chris_streaming.sse_service.tasks import start_workflow
 
-        _, mock_cur = self._mock_db(mock_db_ctx)
+        _, mock_cur = _mock_db(mock_db_ctx)
         mock_get_redis.return_value = MagicMock()
         mock_pfcon.get_server_info.return_value = {
             "requires_copy_job": True,
@@ -451,9 +502,12 @@ class TestStartWorkflowSkipLogic:
 
         start_workflow("job-x", {"image": "img:1"})
 
-        insert_args = mock_cur.execute.call_args_list[0][0][1]
-        params_json = insert_args[2]
-        params = json.loads(params_json)
+        workflow_inserts = [
+            c for c in mock_cur.execute.call_args_list
+            if c[0][0].strip().startswith("INSERT INTO job_workflow ")
+        ]
+        insert_args = workflow_inserts[0][0][1]
+        params = json.loads(insert_args[2])
         assert params["requires_copy_job"] is True
         assert params["requires_upload_job"] is False
         assert params["image"] == "img:1"
@@ -468,13 +522,17 @@ class TestStartWorkflowSkipLogic:
         """When pfcon's config fetch fails, default to requiring both optional steps."""
         from chris_streaming.sse_service.tasks import start_workflow
 
-        _, mock_cur = self._mock_db(mock_db_ctx)
+        _, mock_cur = _mock_db(mock_db_ctx)
         mock_get_redis.return_value = MagicMock()
         mock_pfcon.get_server_info.side_effect = RuntimeError("pfcon down")
 
         start_workflow("job-x", {"image": "img:1"})
 
-        insert_args = mock_cur.execute.call_args_list[0][0][1]
+        workflow_inserts = [
+            c for c in mock_cur.execute.call_args_list
+            if c[0][0].strip().startswith("INSERT INTO job_workflow ")
+        ]
+        insert_args = workflow_inserts[0][0][1]
         assert insert_args[1] == "copy"
         params = json.loads(insert_args[2])
         assert params["requires_copy_job"] is True

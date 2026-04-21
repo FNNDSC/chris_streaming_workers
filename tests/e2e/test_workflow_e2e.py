@@ -8,10 +8,12 @@ This test exercises the complete system:
     → Celery start_workflow
       → pfcon schedule_copy → Docker container
         → Event Forwarder → Redis Streams → Status Consumer → Celery process_job_status
-          → PostgreSQL upsert + Redis Pub/Sub
-        → Log Forwarder → Redis Streams → Log Consumer → Quickwit + Redis Pub/Sub
+          → PostgreSQL upsert + confirmed_* XADD to status stream
+        → Log Forwarder → Redis Streams → Log Consumer → Quickwit
       → workflow state machine: copy → plugin → upload → delete → cleanup
-    → SSE Service streams events via /events/{id}/status and /events/{id}/logs
+        → job_workflow_events table + XADD to workflow stream
+    → SSE Service fans out via ungrouped XREAD on status/logs/workflow streams
+       → /events/{id}/{status|logs|workflow|all}
 
 Requires the full stack from docker-compose.yml.
 """

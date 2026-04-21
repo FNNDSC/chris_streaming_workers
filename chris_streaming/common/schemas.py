@@ -81,6 +81,41 @@ class StatusEvent(BaseModel):
         return cls.model_validate_json(data)
 
 
+class WorkflowEvent(BaseModel):
+    """A workflow state-machine event produced by the Celery worker.
+
+    Published after the matching row is written to ``job_workflow_events``.
+    The event_id matches the history-row event_id so SSE replay from the
+    history table and live-stream fan-out dedup naturally.
+    """
+    event_id: str = ""
+    job_id: str
+    current_step: str
+    current_step_status: str
+    workflow_status: str
+    error: Optional[str] = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_serializer("timestamp")
+    def serialize_timestamp(self, v: datetime, _info) -> str:
+        return v.isoformat()
+
+    def model_post_init(self, __context) -> None:
+        if not self.event_id:
+            raw = (
+                f"{self.job_id}|{self.current_step}|{self.current_step_status}|"
+                f"{self.workflow_status}|{self.error or ''}"
+            )
+            self.event_id = hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+    def serialize(self) -> bytes:
+        return self.model_dump_json().encode("utf-8")
+
+    @classmethod
+    def deserialize(cls, data: bytes) -> "WorkflowEvent":
+        return cls.model_validate_json(data)
+
+
 class LogEvent(BaseModel):
     """A single log line from a container, produced by the Log Forwarder."""
     event_id: str = ""

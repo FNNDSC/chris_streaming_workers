@@ -29,11 +29,13 @@ class TestPostgresSchema:
         with db_conn.cursor() as cur:
             cur.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name IN ('job_status', 'job_workflow')"
+                "WHERE table_schema = 'public' AND table_name IN "
+                "('job_status', 'job_workflow', 'job_workflow_events')"
             )
             tables = {row[0] for row in cur.fetchall()}
         assert "job_status" in tables
         assert "job_workflow" in tables
+        assert "job_workflow_events" in tables
 
 
 class TestPostgresUpsert:

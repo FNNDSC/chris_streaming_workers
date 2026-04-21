@@ -4,7 +4,8 @@ FastAPI routes for the SSE service.
 Endpoints:
   GET  /events/{job_id}/status   - SSE stream of status changes (with historical replay)
   GET  /events/{job_id}/logs     - SSE stream of log lines (with historical replay)
-  GET  /events/{job_id}/all      - SSE stream of both interleaved (with historical replay)
+  GET  /events/{job_id}/workflow - SSE stream of workflow-state events (with historical replay)
+  GET  /events/{job_id}/all      - SSE stream of status + logs + workflow interleaved
   GET  /logs/{job_id}/history    - JSON historical logs from Quickwit
   POST /api/jobs/{job_id}/run    - Submit a workflow (async via Celery)
   GET  /api/jobs/{job_id}/workflow - Workflow status
@@ -63,8 +64,9 @@ class WorkflowRequest(BaseModel):
 async def _event_generator(request: Request, job_id: str, event_type: str):
     """Async generator that yields SSE events: historical replay first, then live."""
     settings = _get_settings()
+    dispatcher = request.app.state.dispatcher
     async for data in subscribe_to_job(
-        redis_url=settings.redis_url,
+        dispatcher=dispatcher,
         job_id=job_id,
         event_type=event_type,
         db_dsn=settings.db_dsn,
@@ -89,9 +91,15 @@ async def stream_logs(request: Request, job_id: str):
     return EventSourceResponse(_event_generator(request, job_id, "logs"))
 
 
+@router.get("/events/{job_id}/workflow")
+async def stream_workflow(request: Request, job_id: str):
+    """SSE stream of workflow-state events for a job."""
+    return EventSourceResponse(_event_generator(request, job_id, "workflow"))
+
+
 @router.get("/events/{job_id}/all")
 async def stream_all(request: Request, job_id: str):
-    """SSE stream of both status and log events for a job."""
+    """SSE stream of status + logs + workflow events for a job."""
     return EventSourceResponse(_event_generator(request, job_id, "all"))
 
 

@@ -2,17 +2,19 @@
 Celery tasks for job status processing and workflow orchestration.
 
 Tasks:
-  - process_job_status: Upserts status to PostgreSQL, publishes to Redis,
-    and advances the workflow state machine on terminal events.
+  - process_job_status: Upserts status to PostgreSQL, emits confirmed_* to the
+    status stream for terminal events, and advances the workflow state machine.
   - start_workflow: Stores workflow params and schedules the copy job on pfcon.
   - cleanup_containers: Waits for logs_flushed signals, then removes containers.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.pool
@@ -20,13 +22,15 @@ import redis as sync_redis
 from celery import Celery, Task
 from celery.signals import worker_init, worker_shutdown
 
-from chris_streaming.common.schemas import StatusEvent, JobStatus
+from chris_streaming.common.redis_stream import ShardRouter
+from chris_streaming.common.schemas import JobStatus, StatusEvent, WorkflowEvent
 from chris_streaming.common.settings import SSEServiceSettings
 from .pfcon_client import PfconClient
 
 logger = logging.getLogger(__name__)
 
 settings = SSEServiceSettings()
+_shard_router = ShardRouter(settings.stream_num_shards)
 
 celery_app = Celery(
     "chris_streaming",
@@ -77,6 +81,20 @@ CREATE TABLE IF NOT EXISTS job_workflow (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS job_workflow_events (
+    id                  BIGSERIAL PRIMARY KEY,
+    job_id              TEXT NOT NULL,
+    current_step        TEXT NOT NULL,
+    current_step_status TEXT NOT NULL,
+    workflow_status     TEXT NOT NULL,
+    error               TEXT,
+    event_id            TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_jwe_job_time ON job_workflow_events (job_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jwe_event_id ON job_workflow_events (event_id);
 """
 
 UPSERT_SQL = """
@@ -262,9 +280,9 @@ def process_job_status(self, event_data: dict) -> dict:
     """
     Process a job status event:
       1. Upsert to PostgreSQL (only if newer than existing row).
-      2. Publish original event to Redis Pub/Sub for real-time SSE delivery.
-      3. For terminal statuses, publish confirmed_* to Redis Pub/Sub.
-      4. If an active workflow exists, advance to the next step.
+      2. For terminal statuses, XADD confirmed_* to the status stream so SSE
+         replicas (and downstream consumers like CUBE) see it.
+      3. If an active workflow exists, advance to the next step.
     """
     job_id = event_data["job_id"]
     job_type = event_data.get("job_type", "")
@@ -288,14 +306,7 @@ def process_job_status(self, event_data: dict) -> dict:
         conn.commit()
     logger.info("Upserted status: job=%s type=%s status=%s", job_id, job_type, status)
 
-    # 2. Publish original event to Redis Pub/Sub
-    channel = f"job:{job_id}:status"
-    original_event = StatusEvent.model_validate(event_data)
-    r = _get_redis()
-    r.publish(channel, original_event.model_dump_json())
-    logger.debug("Published to %s: %s", channel, status)
-
-    # 3. For terminal statuses, also publish confirmed_*
+    # 2. For terminal statuses, emit confirmed_* to the status stream.
     confirmed_status = _CONFIRMED_MAP.get(status)
     if confirmed_status is not None:
         confirmed_event = StatusEvent(
@@ -309,10 +320,23 @@ def process_job_status(self, event_data: dict) -> dict:
             exit_code=event_data.get("exit_code"),
             source=event_data.get("source", "docker"),
         )
-        r.publish(channel, confirmed_event.model_dump_json())
-        logger.info("Published confirmed status: job=%s status=%s", job_id, confirmed_status)
+        shard = _shard_router.shard_for(job_id)
+        stream = _shard_router.stream_name(settings.stream_status_base, shard)
+        try:
+            _get_redis().xadd(
+                stream,
+                {"data": confirmed_event.serialize()},
+                maxlen=settings.stream_status_maxlen,
+                approximate=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "XADD of confirmed_* to %s failed for job=%s: %s",
+                stream, job_id, e,
+            )
+        logger.info("Emitted confirmed status: job=%s status=%s", job_id, confirmed_status)
 
-    # 4. Workflow advancement on terminal events
+    # 3. Workflow advancement on terminal events
     if status in _TERMINAL_STATUSES:
         _try_advance_workflow(job_id, job_type, status)
 
@@ -331,23 +355,56 @@ def _publish_workflow_event(
     workflow_status: str,
     extra: dict | None = None,
 ) -> None:
-    """Publish a structured workflow event to Redis Pub/Sub.
+    """Record a workflow event in the history table and publish it live.
 
     Every workflow event carries three fields:
       - ``current_step``: the step the workflow is now sitting in
       - ``current_step_status``: the status of that current step
       - ``workflow_status``: the overall workflow status (``running`` while
         in motion, or a terminal value at cleanup completion)
+
+    The event_id is deterministic over
+    ``(job_id, current_step, current_step_status, workflow_status, error)``
+    so task retries naturally dedup via ``ON CONFLICT (event_id) DO NOTHING``.
     """
-    payload = {
-        "job_id": job_id,
-        "current_step": current_step,
-        "current_step_status": current_step_status,
-        "workflow_status": workflow_status,
-    }
-    if extra:
-        payload.update(extra)
-    _get_redis().publish(f"job:{job_id}:workflow", json.dumps(payload))
+    error = (extra or {}).get("error") or None
+    event = WorkflowEvent(
+        job_id=job_id,
+        current_step=current_step,
+        current_step_status=current_step_status,
+        workflow_status=workflow_status,
+        error=error,
+    )
+
+    # 1. Durable history row (idempotent on retry via deterministic event_id).
+    try:
+        with _get_db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO job_workflow_events "
+                    "(job_id, current_step, current_step_status, "
+                    " workflow_status, error, event_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (event_id) DO NOTHING",
+                    (job_id, current_step, current_step_status,
+                     workflow_status, error, event.event_id),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.warning("Failed to record workflow event for job=%s: %s", job_id, e)
+
+    # 2. Live fan-out via the sharded workflow stream.
+    shard = _shard_router.shard_for(job_id)
+    stream = _shard_router.stream_name(settings.stream_workflow_base, shard)
+    try:
+        _get_redis().xadd(
+            stream,
+            {"data": event.serialize()},
+            maxlen=settings.stream_workflow_maxlen,
+            approximate=True,
+        )
+    except Exception as e:
+        logger.warning("XADD to %s failed for job=%s: %s", stream, job_id, e)
 
 
 def _try_advance_workflow(job_id: str, job_type: str, status: str) -> None:

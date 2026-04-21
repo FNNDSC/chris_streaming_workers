@@ -2,8 +2,8 @@
 Centralized configuration loaded from environment variables.
 
 Each service imports only the settings class it needs. Redis Streams settings
-are shared; service-specific settings extend them. Redis Pub/Sub and the
-Celery broker reuse the same Redis connection.
+are shared; service-specific settings extend them. The Celery broker reuses
+the same Redis connection as the streams.
 """
 
 from pydantic_settings import BaseSettings
@@ -11,7 +11,7 @@ from pydantic import Field
 
 
 class RedisSettings(BaseSettings):
-    """Redis connection (Pub/Sub, Streams, Celery broker all share it)."""
+    """Redis connection (Streams and Celery broker share it)."""
     redis_url: str = "redis://redis:6379/0"
 
 
@@ -20,6 +20,7 @@ class RedisStreamsSettings(RedisSettings):
     # Stream bases (per-shard streams are keyed as "{base}:{i}")
     stream_status_base: str = "stream:job-status"
     stream_logs_base: str = "stream:job-logs"
+    stream_workflow_base: str = "stream:job-workflow"
     stream_status_dlq: str = "stream:job-status-dlq"
     stream_logs_dlq: str = "stream:job-logs-dlq"
 
@@ -29,6 +30,7 @@ class RedisStreamsSettings(RedisSettings):
     # Retention (approximate MAXLEN trim on XADD)
     stream_status_maxlen: int = 1_000_000
     stream_logs_maxlen: int = 5_000_000
+    stream_workflow_maxlen: int = 100_000
     stream_dlq_maxlen: int = 100_000
 
     # Reclaimer

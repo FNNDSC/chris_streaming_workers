@@ -10,12 +10,12 @@ This repository introduces a push-based alternative with two separate pipelines 
 
 **Event Pipeline** (status changes):
 ```
-Docker/K8s Runtime → Event Forwarder → Redis Stream [stream:job-status:{shard}] → Status Consumer → Celery → Celery Worker → PostgreSQL + Redis Pub/Sub
+Docker/K8s Runtime → Event Forwarder → Redis Stream [stream:job-status:{shard}] → Status Consumer → Celery → Celery Worker → PostgreSQL + confirmed_* XADD back to status stream
 ```
 
 **Log Pipeline** (container output):
 ```
-Docker/K8s Runtime → Log Forwarder → Redis Stream [stream:job-logs:{shard}] → Log Consumer → Quickwit + Redis Pub/Sub
+Docker/K8s Runtime → Log Forwarder → Redis Stream [stream:job-logs:{shard}] → Log Consumer → Quickwit
                                    └ (EOS on log-stream EOF) ┘                              └ SET logs_flushed (post-flush) ┘
 ```
 
@@ -28,13 +28,15 @@ Docker events → Event Forwarder → Redis Stream → Status Consumer → Celer
                                           Workflow state machine:
                                           copy → plugin → upload → delete → cleanup → completed
                                                     ↓
+                                          Each transition → job_workflow_events row + XADD stream:job-workflow:{shard}
+                                                    ↓
                                           cleanup_containers waits for logs_flushed → pfcon DELETE
 ```
 
-Both pipelines feed into a real-time streaming layer with historical replay:
+All three streams feed a real-time broadcast layer with historical replay:
 ```
-Redis Pub/Sub → SSE Service → Browser (EventSource)
-PostgreSQL + Quickwit → SSE Service → Browser (historical replay on connect)
+Redis Streams (status, logs, workflow) → SSE Service StreamDispatcher (ungrouped XREAD) → Browser (EventSource)
+PostgreSQL + Quickwit → SSE Service → Browser (historical replay on connect, deduped against live by event_id)
 ```
 
 Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a given job live on one shard and preserve order, while total throughput scales with the number of shards. Consumers acquire a **lease** per shard (`SET NX PX` with heartbeat refresh) so every shard has exactly one live reader at a time. A background `PendingReclaimer` uses `XAUTOCLAIM`/`XPENDING` to recover messages left in the PEL by crashed consumers and routes them to a DLQ after `N` delivery attempts.
@@ -45,15 +47,15 @@ Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a
 
 - **Log Forwarder** (`compute-log-forwarder`) — Tails container stdout/stderr directly from the compute runtime (aiodocker for Docker, kubernetes-asyncio for K8s), filters by the same `org.chrisproject.miniChRIS=plugininstance` label selector used everywhere else, and `XADD`s each line to the sharded `stream:job-logs:{shard}` stream. When a container's log stream reaches EOF (container exited + buffers drained), emits a final `LogEvent` with `eos=true` on the same shard — this is the signal the Log Consumer uses to mark the container's logs as durable. Replaces the previous FluentBit-based log pipeline.
 
-- **Status Consumer** (`compute-status-consumer`) — Reads status events via `XREADGROUP` from the sharded status streams, then schedules Celery tasks for DB persistence, Redis Pub/Sub publishing, terminal status confirmation, and workflow advancement. Each replica acquires a lease for a subset of shards; a `PendingReclaimer` recovers PEL entries from crashed workers and routes to `stream:job-status-dlq` after the configured retry budget.
+- **Status Consumer** (`compute-status-consumer`) — Reads status events via `XREADGROUP` from the sharded status streams, then schedules Celery tasks for DB persistence, terminal-status confirmation (the Celery worker re-emits `confirmed_*` events via XADD back to the same status stream so SSE clients and CUBE see them), and workflow advancement. `confirmed_*` events that land on the stream are dropped here to avoid a processing loop. Each replica acquires a lease for a subset of shards; a `PendingReclaimer` recovers PEL entries from crashed workers and routes to `stream:job-status-dlq` after the configured retry budget.
 
-- **Log Consumer** (`compute-log-consumer`) — Batched Redis Streams consumer that reads log events from `stream:job-logs:{shard}` (lines and EOS markers, both produced by the Log Forwarder), ingests into Quickwit (`/api/v1/{index}/ingest?commit=force`) for durable storage and search, and publishes to Redis Pub/Sub for real-time log streaming. When an EOS marker appears in the batch, SETs `job:{id}:{type}:logs_flushed` (TTL 1h) **after** the Quickwit commit succeeds so the key cannot fire ahead of the data it attests to. Configurable batch size and flush interval. Horizontal scaling is safe: all replicas share a single consumer group, and a `PendingReclaimer` sweep (with atomic `XCLAIM`) recovers entries left in the PEL by crashed replicas.
+- **Log Consumer** (`compute-log-consumer`) — Batched Redis Streams consumer that reads log events from `stream:job-logs:{shard}` (lines and EOS markers, both produced by the Log Forwarder) and ingests them into Quickwit (`/api/v1/{index}/ingest?commit=force`) for durable storage and search. Live fan-out to SSE clients comes from the same stream — the SSE service runs its own ungrouped `XREAD` on `stream:job-logs:*` and sees every entry independently. When an EOS marker appears in the batch, SETs `job:{id}:{type}:logs_flushed` (TTL 1h) **after** the Quickwit commit succeeds so the key cannot fire ahead of the data it attests to. Configurable batch size and flush interval. Horizontal scaling is safe: all replicas share a single consumer group, and a `PendingReclaimer` sweep (with atomic `XCLAIM`) recovers entries left in the PEL by crashed replicas.
 
 ### Supporting components
 
 The repository also includes supporting infrastructure and a pilot test environment to demonstrate the full pipeline end-to-end:
 
-- **Redis** (single instance by default, with `appendonly yes` + `appendfsync everysec` for durability) — carries Streams (event + log transport), Pub/Sub fan-out, and the Celery broker. An opt-in Sentinel HA topology is provided at [kubernetes/20-infra/redis-ha.yaml](kubernetes/20-infra/redis-ha.yaml) (3 Redis replicas + 3 Sentinels), selectable via a `redis+sentinel://` URL.
+- **Redis** (single instance by default, with `appendonly yes` + `appendfsync everysec` for durability) — carries Streams (event + log + workflow transport) and the Celery broker. SSE fan-out is done via ungrouped `XREAD` directly on the same sharded streams, so every replica sees every event independently with no separate Pub/Sub plane. An opt-in Sentinel HA topology is provided at [kubernetes/20-infra/redis-ha.yaml](kubernetes/20-infra/redis-ha.yaml) (3 Redis replicas + 3 Sentinels), selectable via a `redis+sentinel://` URL.
 - **Quickwit** for log storage and historical replay.
 - **PostgreSQL** for durable status tracking (written by the Celery Worker).
 - **SSE Service** (FastAPI app) that streams events to browsers via SSE, replays historical events from PostgreSQL/Quickwit on connect, exposes REST endpoints for workflow submission and status queries, and exposes a `/metrics` endpoint that reports per-shard stream depth, PEL depth, and DLQ length for both pipelines.
@@ -112,8 +114,7 @@ chris_streaming_workers/
 │   │   ├── __init__.py
 │   │   ├── __main__.py                         # python -m chris_streaming.log_consumer
 │   │   ├── consumer.py                         # Batched XREADGROUP consumer
-│   │   ├── quickwit_writer.py                  # Quickwit ingest wrapper (commit=force)
-│   │   └── redis_publisher.py                  # Per-job Pub/Sub fan-out
+│   │   └── quickwit_writer.py                  # Quickwit ingest wrapper (commit=force)
 │   │
 │   ├── log_forwarder/                          # Produces to stream:job-logs (lines + EOS)
 │   │   ├── __init__.py
@@ -166,7 +167,7 @@ All services run on a single `streaming` Docker network.
 
 | # | Service | Image | Role | Exposed Ports |
 |---|---------|-------|------|---------------|
-| 1 | `redis` | `redis:7-alpine` | Streams transport + Pub/Sub + Celery broker (AOF everysec) | 6379 |
+| 1 | `redis` | `redis:7-alpine` | Streams transport (status/logs/workflow) + Celery broker (AOF everysec) | 6379 |
 | 2 | `quickwit` | `quickwit/quickwit:latest` | Log storage and search (Tantivy index, `/api/v1`) | 7280 |
 | 3 | `postgres` | `postgres:16-alpine` | Celery worker DB | 5433 |
 | 4 | `pfcon` | `ghcr.io/fnndsc/pfcon:latest` | Job control plane (fslink mode) | 30005 |
@@ -174,7 +175,7 @@ All services run on a single `streaming` Docker network.
 | 6 | `event-forwarder` | `localhost/fnndsc/compute-event-forwarder` | Docker events → `stream:job-status` | — |
 | 7 | `log-forwarder` | `localhost/fnndsc/compute-log-forwarder` | Docker container logs → `stream:job-logs` | — |
 | 8 | `status-consumer` | `localhost/fnndsc/compute-status-consumer` | `stream:job-status` → Celery | — |
-| 9 | `log-consumer` | `localhost/fnndsc/compute-log-consumer` | `stream:job-logs` → Quickwit + Redis Pub/Sub | — |
+| 9 | `log-consumer` | `localhost/fnndsc/compute-log-consumer` | `stream:job-logs` → Quickwit | — |
 | 10 | `sse-service` | Built from `Dockerfile.sse_service` | FastAPI SSE streaming + `/metrics` | 8080 |
 | 11 | `celery-worker` | Built from `Dockerfile.sse_service` | Celery status processing + PostgreSQL | — |
 | 12 | `test-ui` | Built from `test_ui/Dockerfile` | nginx + static HTML/JS test app | 8888 |
@@ -379,12 +380,10 @@ tests/
 │   ├── test_common/                      # schemas, pfcon_status, container_naming, settings, redis_stream, stream_metrics
 │   ├── test_event_forwarder/             # producer, docker_watcher, k8s_watcher
 │   ├── test_status_consumer/             # consumer, notifier
-│   ├── test_log_consumer/                # consumer, quickwit_writer, reclaim, redis_publisher
+│   ├── test_log_consumer/                # consumer, quickwit_writer, reclaim
 │   ├── test_log_forwarder/               # forwarder, tailer
-│   └── test_sse_service/                 # app, routes, pfcon_client, tasks
+│   └── test_sse_service/                 # app, routes, pfcon_client, tasks, dispatcher
 ├── integration/                          # Requires Docker Compose infrastructure
-│   ├── test_redis_streams_roundtrip.py   # XADD / XREADGROUP / XACK + reclaimer + DLQ
-│   ├── test_redis_pubsub.py              # Pub/Sub and key operations
 │   ├── test_quickwit.py                  # Quickwit ingest + search against live instance
 │   ├── test_log_consumer_reclaim.py      # PEL reclaim + DLQ via PendingReclaimer
 │   ├── test_postgres.py                  # Schema creation and upsert logic
@@ -394,7 +393,7 @@ tests/
 ```
 
 - **Unit tests** use `fakeredis` and mocks exclusively — no network or container dependencies.
-- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Redis Streams XADD/XREADGROUP/XACK, Redis Pub/Sub, Quickwit ingest + search, PostgreSQL upserts, reclaimer + DLQ behavior).
+- **Integration tests** are marked with `@pytest.mark.integration` and test real service interactions (Redis Streams XADD/XREADGROUP/XACK, Quickwit ingest + search, PostgreSQL upserts, reclaimer + DLQ behavior).
 - **E2E tests** are marked with `@pytest.mark.e2e` and exercise the full pipeline: submit a job via `POST /api/jobs/{id}/run`, verify status events arrive through the SSE stream, check workflow completion, and confirm logs appear in Quickwit. Includes tests for successful workflows, failure scenarios (bad image), and historical replay for late-connecting SSE clients.
 
 
@@ -494,7 +493,7 @@ celery -A chris_streaming.sse_service.tasks worker -l info -Q status-processing 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for publishing confirmed statuses and checking logs_flushed keys |
+| `REDIS_URL` | `redis://redis:6379/0` | Redis URL for XADDing `confirmed_*` back to the status stream, XADDing workflow events, and checking logs_flushed keys |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Celery broker |
 | `DB_DSN` | `postgresql://chris:chris1234@postgres:5432/chris_streaming` | PostgreSQL connection string |
 | `PFCON_URL` | `http://pfcon:30005` | pfcon API base URL |

@@ -1,7 +1,7 @@
 """
 Celery scheduling layer: dispatches every status event to the Celery
-process_job_status task for DB persistence, Redis Pub/Sub publishing,
-and terminal status confirmation.
+process_job_status task for DB persistence and terminal-status
+``confirmed_*`` emission to the status stream.
 """
 
 from __future__ import annotations
@@ -27,7 +27,19 @@ class StatusNotifier:
         )
 
     async def notify(self, event: StatusEvent) -> None:
-        """Schedule a Celery task for DB persistence and Redis publishing."""
+        """Schedule a Celery task for DB persistence and confirmed_* emission.
+
+        ``confirmed_*`` events are re-emitted to the status stream by the
+        Celery worker itself (so SSE clients and CUBE see them). Re-processing
+        those would overwrite the real terminal status in ``job_status`` and
+        cause an infinite loop, so we drop them here.
+        """
+        if event.status.value.startswith("confirmed_"):
+            logger.debug(
+                "Skipping confirmed_* re-entry: job=%s status=%s",
+                event.job_id, event.status.value,
+            )
+            return
         self._celery.send_task(
             "chris_streaming.sse_service.tasks.process_job_status",
             kwargs={"event_data": event.model_dump(mode="json")},

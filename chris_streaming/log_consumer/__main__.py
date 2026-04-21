@@ -4,8 +4,9 @@ Entry point for the Log Consumer service.
     python -m chris_streaming.log_consumer
 
 Reads log events from the sharded ``stream:job-logs:{shard}`` Redis Streams,
-batches them, writes to Quickwit, and publishes to Redis Pub/Sub for
-real-time streaming.
+batches them, and writes to Quickwit. Live fan-out to SSE clients is done
+by the SSE service via an ungrouped ``XREAD`` on the same streams — this
+consumer no longer needs to publish anywhere.
 
 Horizontal scaling: run N replicas. All replicas join the same consumer
 group, and Redis load-balances stream entries across them (no shard lease
@@ -33,7 +34,6 @@ from chris_streaming.common.redis_stream import (
 from chris_streaming.common.settings import LogConsumerSettings
 from .consumer import LogEventConsumer
 from .quickwit_writer import QuickwitWriter
-from .redis_publisher import LogRedisPublisher
 
 logger = structlog.get_logger()
 
@@ -61,10 +61,6 @@ async def main() -> None:
     quickwit = QuickwitWriter(settings.quickwit_url, settings.quickwit_index)
     await quickwit.connect()
 
-    # Redis Pub/Sub publisher (real-time fan-out)
-    redis_pub = LogRedisPublisher(settings.redis_url)
-    await redis_pub.connect()
-
     # Redis client for Streams (decode_responses=False for binary payloads)
     redis = await create_redis_client(settings.redis_url)
 
@@ -76,7 +72,6 @@ async def main() -> None:
         group_name=settings.log_consumer_group,
         consumer_name=consumer_name,
         quickwit=quickwit,
-        redis_pub=redis_pub,
         batch_max_size=settings.batch_max_size,
         batch_max_wait_seconds=settings.batch_max_wait_seconds,
     )
@@ -124,7 +119,6 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
 
-    await redis_pub.close()
     await quickwit.close()
     await redis.close()
     logger.info("Log Consumer stopped")

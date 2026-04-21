@@ -30,7 +30,6 @@ from chris_streaming.log_consumer.quickwit_writer import (
     QuickwitWriter,
     _load_index_config,
 )
-from chris_streaming.log_consumer.redis_publisher import LogRedisPublisher
 
 
 pytestmark = pytest.mark.integration
@@ -78,16 +77,6 @@ async def quickwit_writer(quickwit_url, quickwit_index):
 
 
 
-@pytest.fixture
-async def redis_pub(redis_url):
-    pub = LogRedisPublisher(redis_url)
-    await pub.connect()
-    try:
-        yield pub
-    finally:
-        await pub.close()
-
-
 async def _ensure_group(redis, stream: str) -> None:
     try:
         await redis.xgroup_create(stream, GROUP, id="0", mkstream=True)
@@ -99,7 +88,7 @@ async def _ensure_group(redis, stream: str) -> None:
 class TestLogConsumerReclaim:
     @pytest.mark.asyncio
     async def test_reclaim_redelivers_and_lands_in_quickwit(
-        self, redis, redis_url, quickwit_writer, redis_pub,
+        self, redis, redis_url, quickwit_writer,
         quickwit_url, quickwit_index,
     ):
         """A PEL entry that's reclaimed must end up committed to Quickwit."""
@@ -135,7 +124,6 @@ class TestLogConsumerReclaim:
             group_name=GROUP,
             consumer_name=consumer_name,
             quickwit=quickwit_writer,
-            redis_pub=redis_pub,
             batch_max_size=10,
             batch_max_wait_seconds=0.5,
         )
@@ -182,7 +170,7 @@ class TestLogConsumerReclaim:
 
     @pytest.mark.asyncio
     async def test_over_delivered_entry_lands_in_dlq(
-        self, redis, quickwit_writer, redis_pub,
+        self, redis, quickwit_writer,
     ):
         """After max_deliveries the reclaimer must route the entry to DLQ."""
         num_shards = 2
@@ -248,7 +236,6 @@ class TestLogConsumerReclaim:
             group_name=GROUP,
             consumer_name=consumer_name,
             quickwit=quickwit_writer,
-            redis_pub=redis_pub,
             batch_max_size=10,
             batch_max_wait_seconds=0.5,
         )

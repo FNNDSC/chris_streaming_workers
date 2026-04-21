@@ -38,3 +38,22 @@ class TestStatusNotifier:
             assert call_kwargs["job_id"] == "j1"
             assert call_kwargs["job_type"] == "copy"
             assert call_kwargs["status"] == "notStarted"
+
+    async def test_notify_skips_confirmed_events_to_avoid_loop(self):
+        """confirmed_* events are re-emitted by the Celery worker to the same
+        status stream this notifier reads from — re-processing them would
+        loop and overwrite the real terminal row."""
+        with patch("chris_streaming.status_consumer.notifier.Celery") as MockCelery:
+            mock_app = MagicMock()
+            MockCelery.return_value = mock_app
+
+            notifier = StatusNotifier("redis://localhost:6379/0")
+            event = StatusEvent(
+                job_id="j1",
+                job_type=JobType.plugin,
+                status=JobStatus.confirmed_finishedSuccessfully,
+                previous_status=JobStatus.finishedSuccessfully,
+            )
+            await notifier.notify(event)
+
+            mock_app.send_task.assert_not_called()

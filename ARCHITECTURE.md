@@ -40,16 +40,23 @@ end
 subgraph L["Log Pipeline"]
     LS["Log Forwarder<br/><i>aiodocker / kubernetes-asyncio tailer</i>"]
     RS2[("Redis Streams: stream:job-logs:{0..N-1}<br/><small>sharded by md5(job_id) · AOF everysec · MAXLEN~ trim</small>")]
-    LC["Log Consumer<br/><small>lease-based shard owner</small>"]
+    LC["Log Consumer<br/><small>group-based shard sweep</small>"]
     QW[("Quickwit")]
+end
+
+%% =========================
+%% WORKFLOW PIPELINE
+%% =========================
+subgraph W["Workflow Pipeline"]
+    RS3[("Redis Streams: stream:job-workflow:{0..N-1}<br/><small>sharded by md5(job_id) · AOF everysec · MAXLEN~ trim</small>")]
+    WFT[("PostgreSQL<br/>job_workflow_events")]
 end
 
 %% =========================
 %% REAL-TIME STREAMING LAYER
 %% =========================
 subgraph R["Real-time Streaming Layer"]
-    RD[("Redis Pub/Sub<br/><small>job:{id}:status · job:{id}:logs</small>")]
-    SSE["SSE Service<br/><small>FastAPI + sse-starlette</small>"]
+    SSE["SSE Service<br/><small>FastAPI + sse-starlette<br/>StreamDispatcher (ungrouped XREAD)</small>"]
     UI["Test UI<br/><small>nginx + EventSource</small>"]
 end
 
@@ -69,7 +76,7 @@ RS1 -- "XREADGROUP" --> ST
 ST -- "all events" --> CQ
 CQ --> CW
 CW -- "upsert" --> PG
-CW -- "PUBLISH<br/>job:{id}:status" --> RD
+CW -- "XADD confirmed_*<br/>back to status stream" --> RS1
 CW -- "workflow step<br/>advancement" --> PFCON
 
 %% =========================
@@ -79,14 +86,21 @@ DCKR -- "docker log API<br/>(stdout/stderr tail)" --> LS
 K8S -. "pod log API<br/>(stdout/stderr tail)" .-> LS
 LS -- "XADD LogEvent<br/>(+ eos=true on EOF)" --> RS2
 RS2 -- "XREADGROUP" --> LC
-LC -- "bulk _bulk API" --> ES
-LC -. "SET logs_flushed<br/>(after flush, on EOS)" .-> RD
+LC -- "ingest (commit=force)" --> QW
+LC -. "SET logs_flushed<br/>(after flush, on EOS)" .-> RS1
+
+%% =========================
+%% WORKFLOW FLOWS
+%% =========================
+CW -- "INSERT job_workflow_events" --> WFT
+CW -- "XADD WorkflowEvent" --> RS3
 
 %% =========================
 %% REAL-TIME FLOWS
 %% =========================
-LC -- "PUBLISH<br/>job:{id}:logs" --> RD
-RD -- "SUBSCRIBE" --> SSE
+RS1 -. "ungrouped XREAD" .-> SSE
+RS2 -. "ungrouped XREAD" .-> SSE
+RS3 -. "ungrouped XREAD" .-> SSE
 SSE -- "SSE<br/>EventSource" --> UI
 UI -- "POST /api/jobs/{id}/run" --> SSE
 
@@ -94,7 +108,8 @@ UI -- "POST /api/jobs/{id}/run" --> SSE
 %% HISTORY QUERY + REPLAY
 %% =========================
 SSE -. "historical replay<br/>(on SSE connect)" .-> PG
-SSE -. "historical replay<br/>(on SSE connect)" .-> ES
+SSE -. "historical replay<br/>(on SSE connect)" .-> QW
+SSE -. "historical replay<br/>(on SSE connect)" .-> WFT
 
 %% =========================
 %% STYLING
@@ -105,7 +120,7 @@ classDef runtime fill:#1a1a2e,stroke:#4ade80,color:#eee
 classDef ui fill:#16213e,stroke:#fbbf24,color:#eee
 
 class EF,ST,LC,LS worker
-class RS1,RS2,PG,ES,RD,CQ,CW infra
+class RS1,RS2,RS3,PG,QW,WFT,CQ,CW infra
 class K8S,DCKR,PFCON runtime
 class SSE,UI ui
 ```
@@ -129,8 +144,7 @@ class SSE,UI ui
    - Schedules a **Celery task** `process_job_status` for every event. The consumer has no direct Redis key-space or PostgreSQL dependency — all persistence and publishing is delegated to the Celery Worker.
 4. **Celery Worker** picks up every `process_job_status` task:
    - Upserts to **PostgreSQL** (`ON CONFLICT DO UPDATE` with timestamp guard — idempotent and order-safe).
-   - Publishes the original status event to **Redis Pub/Sub** channel `job:{job_id}:status` for real-time SSE delivery.
-   - For terminal statuses (`finishedSuccessfully`, `finishedWithError`, `undefined`), also publishes a `confirmed_*` status event to the same Redis channel.
+   - For terminal statuses (`finishedSuccessfully`, `finishedWithError`, `undefined`), `XADD`s a `confirmed_*` status event **back onto the same `stream:job-status:{shard}` stream** so SSE clients and CUBE see the confirmation. The Status Consumer drops `confirmed_*` entries on re-entry to avoid a processing loop.
    - For terminal statuses, checks if an active workflow exists and advances to the next step (see Workflow Orchestration below).
 
 ### Log pipeline (container output)
@@ -144,23 +158,24 @@ class SSE,UI ui
    - When the container's log stream closes (container exited and buffered output drained), emits a final `LogEvent` with `eos=true` on the same shard. EOS is sourced from the same stream iterator that produced the lines, so no line can arrive after the EOS.
 2. **Log Consumer** reads from the sharded log streams via `XREADGROUP` in configurable batches (default: 200 messages or 2 seconds):
    - Ingests to **Quickwit** via `POST /api/v1/{index}/ingest?commit=force` (NDJSON). The `commit=force` flag blocks until the documents are committed and searchable — ensuring the EOS / `logs_flushed` contract holds.
-   - Publishes each event to **Redis Pub/Sub** channel `job:{job_id}:logs`.
    - `XACK`s messages only after a successful Quickwit ingest (at-least-once).
    - Messages that repeatedly fail and exceed `reclaim_max_deliveries` are routed by the `PendingReclaimer` to `stream:job-logs-dlq`. Unlike the Status Consumer there is no shard lease: every replica sweeps every shard, and the atomic `XCLAIM` prevents double-processing.
    - When an EOS marker is in the batch, SETs `job:{job_id}:{job_type}:logs_flushed` with 1-hour TTL **after** the Quickwit write succeeds (so the key cannot fire ahead of the data it attests to). If the write fails, the EOS stays pending and is retried.
+   - SSE fan-out of log lines does **not** go through the Log Consumer — the SSE service runs its own ungrouped `XREAD` on `stream:job-logs:*` and sees every entry independently.
 
 ### Real-time streaming layer
 
-1. **SSE Service** (FastAPI) exposes SSE and REST endpoints:
-   - `GET /events/{job_id}/status` — subscribes to Redis `job:{job_id}:status`, streams as SSE with historical replay from PostgreSQL.
-   - `GET /events/{job_id}/logs` — subscribes to Redis `job:{job_id}:logs`, streams as SSE with historical replay from Quickwit.
-   - `GET /events/{job_id}/all` — subscribes to both channels with full historical replay.
+1. **SSE Service** (FastAPI) exposes SSE and REST endpoints. A single process-wide `StreamDispatcher` runs one ungrouped `XREAD` loop per base stream (`stream:job-status`, `stream:job-logs`, `stream:job-workflow`) across every shard and fans entries out to per-subscriber `asyncio.Queue`s by `job_id`:
+   - `GET /events/{job_id}/status` — subscribes to status entries for this job, streams as SSE with historical replay from PostgreSQL.
+   - `GET /events/{job_id}/logs` — subscribes to log entries for this job, streams as SSE with historical replay from Quickwit.
+   - `GET /events/{job_id}/workflow` — subscribes to workflow transitions for this job, streams as SSE with historical replay from `job_workflow_events`.
+   - `GET /events/{job_id}/all` — subscribes to all three streams with full historical replay.
    - `GET /logs/{job_id}/history` — queries Quickwit for historical logs (JSON).
    - `POST /api/jobs/{job_id}/run` — submits a workflow via Celery (202 Accepted).
    - `GET /api/jobs/{job_id}/workflow` — queries workflow state (current step, status).
    - `GET /api/jobs/{job_id}/status/history` — queries all status records for a job.
-   - `GET /metrics` — snapshot of per-shard `XLEN`, PEL depth, and DLQ length for both pipelines. Used by smoke tests and operational dashboards.
-2. **Historical replay**: When an SSE client connects, the service first subscribes to Redis Pub/Sub (to start buffering live events), then replays historical events from PostgreSQL (statuses) and Quickwit (logs). Events are deduplicated by `event_id` to prevent duplicates between historical and live data.
+   - `GET /metrics` — snapshot of per-shard `XLEN`, PEL depth, and DLQ length for all three pipelines. Used by smoke tests and operational dashboards.
+2. **Historical replay**: When an SSE client connects, the service first registers the subscriber with the `StreamDispatcher` (to start buffering live entries into the subscriber's queue), then replays historical events from PostgreSQL (statuses + workflow) and Quickwit (logs). Events are deduplicated by `event_id` to prevent duplicates between historical and live data.
 3. **Test UI** (nginx + vanilla JS) proxies to the SSE service. The browser submits workflows via `POST /sse/api/jobs/{id}/run` and uses `EventSource` to subscribe to SSE streams. All workflow orchestration happens server-side.
 
 ### Workflow orchestration
@@ -196,11 +211,11 @@ The `copy` and `upload` steps are **optional** — at workflow start the Celery 
      - If plugin is `finishedSuccessfully` → workflow `status = finishedSuccessfully`.
      - If plugin is `finishedWithError` → workflow `status = finishedWithError` (a clean non-zero exit of the plugin container is a legitimate run outcome, not a workflow failure).
      - Otherwise (any required step missing or non-success, or plugin in another state like `undefined`) → workflow `status = failed`.
-   - Updates `job_workflow.status` with the terminal value and publishes the final `job:{id}:workflow` Redis event.
+   - Updates `job_workflow.status` with the terminal value, inserts the final row into `job_workflow_events`, and XADDs the final `WorkflowEvent` onto `stream:job-workflow:{shard}`.
 
-#### Workflow Redis event shape
+#### Workflow event shape
 
-Every `job:{id}:workflow` publish carries:
+Every entry on `stream:job-workflow:{shard}` (and every `job_workflow_events` row) carries:
 
 | Field | Description |
 |-------|-------------|
@@ -244,7 +259,7 @@ Mirrors pfcon's `JobInfo` dataclass from `pfcon/compute/abstractmgr.py`.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `event_id` | `str` | Deterministic SHA-256 hash derived from `(job_id, job_type, container_name, stream, timestamp, line)` — used to dedupe replayed history against live Redis Pub/Sub messages |
+| `event_id` | `str` | Deterministic SHA-256 hash derived from `(job_id, job_type, container_name, stream, timestamp, line)` — used to dedupe replayed history against live stream entries |
 | `job_id` | `str` | pfcon job identifier |
 | `job_type` | `enum` | `plugin`, `copy`, `upload`, or `delete` |
 | `container_name` | `str` | Docker container name |
@@ -298,8 +313,8 @@ Status Consumer (shard owner)
         ▼
 Celery Worker
   ├── Upsert PostgreSQL (with timestamp guard for ordering safety)
-  ├── PUBLISH job:{id}:status (original status)
-  ├── [terminal only] PUBLISH job:{id}:status (confirmed_finishedSuccessfully, etc.)
+  ├── [terminal only] XADD confirmed_* onto stream:job-status:{shard}
+  │   (Status Consumer drops confirmed_* on re-entry to avoid a loop)
   └── [terminal only] Check workflow and advance step
         │
         ├── [next step] Call pfcon to schedule next job
@@ -308,7 +323,7 @@ Celery Worker
               └── Wait for logs_flushed → DELETE containers → Mark completed
 ```
 
-The Status Consumer is a pure "Redis Streams → Celery" bridge with no direct key-space or PostgreSQL dependency. The Celery Worker handles all persistence (PostgreSQL), real-time delivery (Redis Pub/Sub), terminal confirmation, and workflow orchestration.
+The Status Consumer is a pure "Redis Streams → Celery" bridge with no direct key-space or PostgreSQL dependency. The Celery Worker handles all persistence (PostgreSQL + `job_workflow_events`), terminal confirmation (`confirmed_*` XADD back to the status stream), workflow-transition emission (XADD on `stream:job-workflow:{shard}`), and workflow orchestration. SSE fan-out is not a Celery concern — the SSE service reads the same streams directly via ungrouped `XREAD`.
 
 The `confirmed_` prefix separates "the remote compute reported this" from "our backend acknowledged it." This is the hook where CUBE's processing logic (file registration, feed updates) would execute in production.
 
