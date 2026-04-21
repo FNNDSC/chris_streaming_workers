@@ -44,13 +44,30 @@ class RedisStreamsSettings(RedisSettings):
     lease_acquire_interval_ms: int = 2_000
 
 
-class EventForwarderSettings(RedisStreamsSettings):
+class K8sLeaderElectionSettings(BaseSettings):
+    """Leader-election tuning used by the K8s forwarder entry points."""
+    # Namespace the coordination.k8s.io/Lease lives in. Typically the same
+    # namespace as the workload; overridable so a central namespace can
+    # hold leases from many workloads.
+    k8s_leader_namespace: str = "chris-streaming"
+    k8s_leader_lease_duration_seconds: int = 15
+    k8s_leader_renew_deadline_seconds: int = 10
+    k8s_leader_retry_period_seconds: int = 2
+    # Identity of this replica as seen in ``kubectl describe lease``;
+    # falls back to hostname+uuid if unset. In-cluster, set from the
+    # Downward API ``metadata.name`` so each Pod gets a unique value.
+    k8s_leader_identity: str = ""
+
+
+class EventForwarderSettings(RedisStreamsSettings, K8sLeaderElectionSettings):
     """Event Forwarder specific settings."""
     compute_env: str = Field("docker", description="docker or kubernetes")
     docker_label_filter: str = "org.chrisproject.miniChRIS"
     docker_label_value: str = "plugininstance"
     k8s_namespace: str = "default"
     k8s_label_selector: str = "chrisproject.org/role=plugininstance"
+    # Lease object name for event-forwarder leader election.
+    k8s_leader_lease_name: str = "chris-event-forwarder"
     # On startup, emit current state of all matching containers
     emit_initial_state: bool = True
     # Opt-in Docker reconciler: periodically inspect tracked containers
@@ -80,13 +97,15 @@ class LogConsumerSettings(RedisStreamsSettings):
     batch_max_wait_seconds: float = 2.0
 
 
-class LogForwarderSettings(RedisStreamsSettings):
+class LogForwarderSettings(RedisStreamsSettings, K8sLeaderElectionSettings):
     """Log Forwarder specific settings."""
     compute_env: str = Field("docker", description="docker or kubernetes")
     docker_label_filter: str = "org.chrisproject.miniChRIS"
     docker_label_value: str = "plugininstance"
     k8s_namespace: str = "default"
     k8s_label_selector: str = "chrisproject.org/role=plugininstance"
+    # Lease object name for log-forwarder leader election.
+    k8s_leader_lease_name: str = "chris-log-forwarder"
 
 
 class SSEServiceSettings(RedisStreamsSettings):

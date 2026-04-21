@@ -48,6 +48,42 @@ def _create_tailer(settings: LogForwarderSettings):
             raise ValueError(f"Unsupported compute_env: {settings.compute_env}")
 
 
+async def _run_forwarder(
+    settings: LogForwarderSettings,
+    shutdown_event: asyncio.Event,
+    cancel_event: asyncio.Event | None = None,
+) -> None:
+    """One iteration of the tailer body, used by both Docker and K8s paths."""
+    redis = await create_redis_client(settings.redis_url)
+    producer = RedisStreamProducer(
+        redis,
+        StreamProducerConfig(
+            base_stream=settings.stream_logs_base,
+            num_shards=settings.stream_num_shards,
+            maxlen_approx=settings.stream_logs_maxlen,
+        ),
+    )
+    forwarder = LogForwarder(producer)
+    tailer = _create_tailer(settings)
+
+    def _should_stop() -> bool:
+        if shutdown_event.is_set():
+            return True
+        return cancel_event is not None and cancel_event.is_set()
+
+    try:
+        async with tailer:
+            async for line in tailer.stream():
+                if _should_stop():
+                    break
+                try:
+                    await forwarder.forward(line)
+                except Exception as e:
+                    logger.warning("forward failed: %s", e)
+    finally:
+        await redis.close()
+
+
 async def main() -> None:
     settings = LogForwarderSettings()
 
@@ -64,18 +100,6 @@ async def main() -> None:
         num_shards=settings.stream_num_shards,
     )
 
-    redis = await create_redis_client(settings.redis_url)
-    producer = RedisStreamProducer(
-        redis,
-        StreamProducerConfig(
-            base_stream=settings.stream_logs_base,
-            num_shards=settings.stream_num_shards,
-            maxlen_approx=settings.stream_logs_maxlen,
-        ),
-    )
-    forwarder = LogForwarder(producer)
-    tailer = _create_tailer(settings)
-
     shutdown_event = asyncio.Event()
 
     def _shutdown(sig):
@@ -87,16 +111,39 @@ async def main() -> None:
         loop.add_signal_handler(sig, _shutdown, sig)
 
     try:
-        async with tailer:
-            async for line in tailer.stream():
-                if shutdown_event.is_set():
-                    break
+        if settings.compute_env in ("kubernetes", "openshift"):
+            from chris_streaming.common.k8s_leader import LeaderElection
+
+            election = LeaderElection(
+                namespace=settings.k8s_leader_namespace,
+                name=settings.k8s_leader_lease_name,
+                identity=settings.k8s_leader_identity or None,
+                lease_duration_seconds=settings.k8s_leader_lease_duration_seconds,
+                renew_deadline_seconds=settings.k8s_leader_renew_deadline_seconds,
+                retry_period_seconds=settings.k8s_leader_retry_period_seconds,
+            )
+
+            async def body(cancel_event: asyncio.Event) -> None:
+                await _run_forwarder(settings, shutdown_event, cancel_event)
+
+            election_task = asyncio.create_task(election.run(body))
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            done, pending = await asyncio.wait(
+                {election_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in pending:
                 try:
-                    await forwarder.forward(line)
-                except Exception as e:
-                    logger.warning("forward failed: %s", e)
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if election_task in done:
+                election_task.result()
+        else:
+            await _run_forwarder(settings, shutdown_event)
     finally:
-        await redis.close()
         logger.info("Log Forwarder stopped")
 
 

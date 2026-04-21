@@ -309,17 +309,30 @@ def process_job_status(self, event_data: dict) -> dict:
     # 2. For terminal statuses, emit confirmed_* to the status stream.
     confirmed_status = _CONFIRMED_MAP.get(status)
     if confirmed_status is not None:
-        confirmed_event = StatusEvent(
-            job_id=job_id,
-            job_type=event_data["job_type"],
-            status=JobStatus(confirmed_status),
-            previous_status=JobStatus(status),
-            image=event_data.get("image", ""),
-            cmd=event_data.get("cmd", ""),
-            message="confirmed by celery worker",
-            exit_code=event_data.get("exit_code"),
-            source=event_data.get("source", "docker"),
-        )
+        # Reuse the source event's timestamp so the confirmed_* event_id
+        # is deterministic across Celery retries — otherwise every retry
+        # would synthesize ``datetime.now()`` and produce a fresh event_id,
+        # defeating downstream dedup.
+        src_ts = event_data.get("timestamp")
+        if isinstance(src_ts, str):
+            try:
+                src_ts = datetime.fromisoformat(src_ts.replace("Z", "+00:00"))
+            except ValueError:
+                src_ts = None
+        confirmed_kwargs = {
+            "job_id": job_id,
+            "job_type": event_data["job_type"],
+            "status": JobStatus(confirmed_status),
+            "previous_status": JobStatus(status),
+            "image": event_data.get("image", ""),
+            "cmd": event_data.get("cmd", ""),
+            "message": "confirmed by celery worker",
+            "exit_code": event_data.get("exit_code"),
+            "source": event_data.get("source", "docker"),
+        }
+        if src_ts is not None:
+            confirmed_kwargs["timestamp"] = src_ts
+        confirmed_event = StatusEvent(**confirmed_kwargs)
         shard = _shard_router.shard_for(job_id)
         stream = _shard_router.stream_name(settings.stream_status_base, shard)
         try:
@@ -410,79 +423,127 @@ def _publish_workflow_event(
 def _try_advance_workflow(job_id: str, job_type: str, status: str) -> None:
     """Check if there's an active workflow and advance to the next step.
 
-    The workflow stays in ``running`` state until cleanup completes, at which
-    point ``cleanup_containers`` computes the terminal workflow status from
-    the per-step records in ``job_status``. This function never writes a
-    terminal status to ``job_workflow``.
+    Crash-safety: pfcon is idempotent on ``jid``, so the protocol is
+    "schedule-then-advance":
+
+        1. Read the current step under ``FOR UPDATE`` (serialize retries).
+        2. Call pfcon for the next step (or schedule cleanup).
+        3. UPDATE ``current_step`` with a CAS on the old step, then commit.
+
+    If the worker dies between steps 1-2 or 2-3, Celery re-queues the
+    message (``acks_late=True`` + ``reject_on_worker_lost=True``) and the
+    retry re-runs the whole protocol: pfcon returns the existing job
+    instead of double-scheduling, and the CAS UPDATE converges. An
+    earlier implementation committed the UPDATE *before* calling pfcon,
+    so a crash in between left the workflow stuck in the new step with
+    no container ever scheduled.
+
+    When ``_execute_workflow_step`` reports a synchronous completion
+    (pfcon failure or ``*Skipped`` terminal status, both of which create
+    no container), the returned continuation drives another advance
+    pass — but only *after* the current transaction commits and releases
+    the row lock, so the recursive advance can re-acquire it.
+
+    The workflow stays in ``running`` state until cleanup completes, at
+    which point ``cleanup_containers`` computes the terminal workflow
+    status from the per-step records in ``job_status``.
+    """
+    while True:
+        continuation = _try_advance_workflow_once(job_id, job_type, status)
+        if continuation is None:
+            return
+        job_type, status = continuation
+
+
+def _try_advance_workflow_once(
+    job_id: str, job_type: str, status: str,
+) -> tuple[str, str] | None:
+    """One atomic advancement pass. Returns a synthetic continuation event
+    if the scheduled step completed synchronously (no container created)
+    and another advance pass is needed.
     """
     with _get_db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT current_step, params FROM job_workflow "
-                "WHERE job_id = %s AND status = 'running' FOR UPDATE",
-                (job_id,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return  # No active workflow for this job
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT current_step, params FROM job_workflow "
+                    "WHERE job_id = %s AND status = 'running' FOR UPDATE",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return None  # No active workflow for this job
 
-            current_step, params = row
-            expected_job_type = _STEP_JOB_TYPE.get(current_step)
+                current_step, params = row
+                expected_job_type = _STEP_JOB_TYPE.get(current_step)
+                if job_type != expected_job_type:
+                    conn.rollback()
+                    return None
 
-            # Only advance if this event matches the current step's job_type.
-            if job_type != expected_job_type:
-                return
+                succeeded = (status == "finishedSuccessfully")
+                if succeeded:
+                    next_step = _next_active_step(current_step, params)
+                else:
+                    next_step = _FAILURE_STEP.get(current_step, "cleanup")
 
-            succeeded = (status == "finishedSuccessfully")
-
-            if succeeded:
-                next_step = _next_active_step(current_step, params)
+            # Side effects BEFORE committing the advance. pfcon is
+            # idempotent on jid so retries are safe. Cleanup scheduling
+            # goes through Celery .delay() which is also retry-safe.
+            continuation: tuple[str, str] | None = None
+            if next_step == "cleanup":
+                _publish_workflow_event(job_id, "cleanup", "started", "running")
+                cleanup_containers.delay(job_id)
             else:
-                # On failure: skip to delete for cleanup (or cleanup if already at delete).
-                next_step = _FAILURE_STEP.get(current_step, "cleanup")
+                _publish_workflow_event(job_id, next_step, "started", "running")
+                continuation = _execute_workflow_step(job_id, next_step, params)
 
-            cur.execute(
-                "UPDATE job_workflow SET current_step = %s, updated_at = NOW() "
-                "WHERE job_id = %s AND current_step = %s",
-                (next_step, job_id, current_step),
-            )
-            advanced = cur.rowcount > 0
-        conn.commit()
+            # Commit the advance last, after the external side effects
+            # have succeeded. CAS ensures concurrent advancers don't
+            # double-advance.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE job_workflow SET current_step = %s, updated_at = NOW() "
+                    "WHERE job_id = %s AND current_step = %s",
+                    (next_step, job_id, current_step),
+                )
+                advanced = cur.rowcount > 0
+            conn.commit()
 
-    if not advanced:
-        logger.debug("Workflow step already advanced for job=%s", job_id)
-        return
-
-    logger.info(
-        "Workflow advanced: job=%s %s → %s (succeeded=%s)",
-        job_id, current_step, next_step, succeeded,
-    )
-
-    if next_step == "cleanup":
-        # The delete step is done — schedule container cleanup. Publish
-        # 'started' for the cleanup step; the terminal event is published
-        # by cleanup_containers itself.
-        _publish_workflow_event(job_id, "cleanup", "started", "running")
-        cleanup_containers.delay(job_id)
-        return
-
-    # Publish the 'started' state of the new step, then execute it. If the
-    # pfcon call returns an immediate terminal status, _execute_workflow_step
-    # will recurse into _try_advance_workflow and publish the next event.
-    _publish_workflow_event(job_id, next_step, "started", "running")
-    _execute_workflow_step(job_id, next_step, params)
+            if advanced:
+                logger.info(
+                    "Workflow advanced: job=%s %s → %s (succeeded=%s)",
+                    job_id, current_step, next_step, succeeded,
+                )
+            else:
+                logger.debug(
+                    "Workflow step already advanced for job=%s (step=%s)",
+                    job_id, current_step,
+                )
+            return continuation
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
 
 
-def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
-    """Call pfcon to schedule the appropriate job for a workflow step.
+def _execute_workflow_step(
+    job_id: str, step: str, params: dict,
+) -> tuple[str, str] | None:
+    """Call pfcon to schedule the job for a workflow step.
 
-    If pfcon returns an immediate terminal status (e.g., uploadSkipped,
-    deleteSkipped, copySkipped), advances the workflow without waiting
-    for a Docker event — because no container was created. If the pfcon
-    call itself raises, the workflow is advanced as if the step had
-    reported ``finishedWithError``, which will route via the failure path
-    to ``delete`` → cleanup; the terminal workflow status is computed at
-    cleanup time from ``job_status``.
+    Returns a ``(job_type, status)`` continuation if the step completed
+    synchronously (no container created): either because pfcon raised
+    (→ ``finishedWithError``) or because pfcon returned an immediate
+    terminal status such as ``uploadSkipped`` / ``copySkipped``. The
+    caller uses the continuation to drive another advance pass *after*
+    committing the current advance — doing it inline would deadlock on
+    the ``FOR UPDATE`` row lock still held by the caller.
+
+    Returns ``None`` when the step was scheduled normally and the workflow
+    is now waiting for a status event from the job container.
     """
     resp = None
     try:
@@ -510,9 +571,7 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
             job_id, step, "finishedWithError", "running",
             extra={"error": str(e)},
         )
-        # Advance as if the step had reported finishedWithError.
-        _try_advance_workflow(job_id, jt, "finishedWithError")
-        return
+        return (jt, "finishedWithError")
 
     # Check if pfcon returned an immediate terminal status (no container created).
     # This happens for uploadSkipped, deleteSkipped, copySkipped in fslink mode.
@@ -527,8 +586,8 @@ def _execute_workflow_step(job_id: str, step: str, params: dict) -> None:
         jt = _STEP_JOB_TYPE[step]
         _get_redis().set(f"job:{job_id}:{jt}:logs_flushed", "1", ex=3600)
         logger.info("Set logs_flushed for skipped step: job=%s type=%s", job_id, jt)
-
-        _try_advance_workflow(job_id, jt, pfcon_status)
+        return (jt, pfcon_status)
+    return None
 
 
 # ── start_workflow ──────────────────────────────────────────────────────────
@@ -562,17 +621,28 @@ def start_workflow(self, job_id: str, params: dict) -> dict:
 
     initial_step = _first_active_step(params)
 
+    # Idempotent insert: a second start_workflow call for the same job_id
+    # (duplicate submission, task retry, etc.) must NOT overwrite an
+    # already-running workflow. The previous implementation used
+    # ``ON CONFLICT DO UPDATE SET current_step = EXCLUDED.current_step``,
+    # which reset an advanced workflow back to its initial step.
     with _get_db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO job_workflow (job_id, current_step, status, params) "
                 "VALUES (%s, %s, 'running', %s) "
-                "ON CONFLICT (job_id) DO UPDATE SET "
-                "current_step = EXCLUDED.current_step, status = 'running', "
-                "params = EXCLUDED.params, updated_at = NOW()",
+                "ON CONFLICT (job_id) DO NOTHING",
                 (job_id, initial_step, json.dumps(params)),
             )
+            inserted = cur.rowcount > 0
         conn.commit()
+
+    if not inserted:
+        logger.info(
+            "start_workflow: job=%s already exists — skipping re-start", job_id,
+        )
+        return {"job_id": job_id, "status": "already_started"}
+
     logger.info(
         "Workflow started: job=%s initial_step=%s requires_copy=%s requires_upload=%s",
         job_id, initial_step,
@@ -581,7 +651,12 @@ def start_workflow(self, job_id: str, params: dict) -> dict:
 
     _publish_workflow_event(job_id, initial_step, "started", "running")
 
-    _execute_workflow_step(job_id, initial_step, params)
+    continuation = _execute_workflow_step(job_id, initial_step, params)
+    if isinstance(continuation, tuple) and len(continuation) == 2:
+        # pfcon completed the initial step synchronously; drive the
+        # workflow forward from here via the normal advance loop.
+        jt, st = continuation
+        _try_advance_workflow(job_id, jt, st)
 
     return {"job_id": job_id, "status": "started"}
 

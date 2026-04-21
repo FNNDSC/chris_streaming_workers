@@ -43,6 +43,47 @@ def _create_watcher(settings: EventForwarderSettings) -> Watcher:
             raise ValueError(f"Unsupported compute_env: {settings.compute_env}")
 
 
+async def _run_forwarder(
+    settings: EventForwarderSettings,
+    shutdown_event: asyncio.Event,
+    cancel_event: asyncio.Event | None = None,
+) -> None:
+    """Run one iteration of the forwarder body (watch → produce).
+
+    On K8s, ``cancel_event`` is set by the leader-election layer when this
+    replica loses the lease; the body stops cleanly so a new leader can
+    take over without cross-replica duplicate emission.
+    """
+    redis = await create_redis_client(settings.redis_url)
+
+    stream_producer = RedisStreamProducer(
+        redis,
+        StreamProducerConfig(
+            base_stream=settings.stream_status_base,
+            num_shards=settings.stream_num_shards,
+            maxlen_approx=settings.stream_status_maxlen,
+        ),
+    )
+    producer = StatusEventProducer(stream_producer)
+    watcher = _create_watcher(settings)
+
+    async def _should_stop() -> bool:
+        if shutdown_event.is_set():
+            return True
+        return cancel_event is not None and cancel_event.is_set()
+
+    try:
+        async with watcher:
+            async for event in watcher.watch():
+                if await _should_stop():
+                    break
+                await producer.send(event)
+    finally:
+        logger.info("Shutting down producers")
+        await producer.close()
+        await redis.close()
+
+
 async def main() -> None:
     settings = EventForwarderSettings()
 
@@ -59,20 +100,6 @@ async def main() -> None:
         num_shards=settings.stream_num_shards,
     )
 
-    redis = await create_redis_client(settings.redis_url)
-
-    stream_producer = RedisStreamProducer(
-        redis,
-        StreamProducerConfig(
-            base_stream=settings.stream_status_base,
-            num_shards=settings.stream_num_shards,
-            maxlen_approx=settings.stream_status_maxlen,
-        ),
-    )
-    producer = StatusEventProducer(stream_producer)
-
-    watcher = _create_watcher(settings)
-
     shutdown_event = asyncio.Event()
 
     def _shutdown(sig):
@@ -84,15 +111,42 @@ async def main() -> None:
         loop.add_signal_handler(sig, _shutdown, sig)
 
     try:
-        async with watcher:
-            async for event in watcher.watch():
-                if shutdown_event.is_set():
-                    break
-                await producer.send(event)
+        if settings.compute_env in ("kubernetes", "openshift"):
+            # Leader election: only one replica emits at a time.
+            from chris_streaming.common.k8s_leader import LeaderElection
+
+            election = LeaderElection(
+                namespace=settings.k8s_leader_namespace,
+                name=settings.k8s_leader_lease_name,
+                identity=settings.k8s_leader_identity or None,
+                lease_duration_seconds=settings.k8s_leader_lease_duration_seconds,
+                renew_deadline_seconds=settings.k8s_leader_renew_deadline_seconds,
+                retry_period_seconds=settings.k8s_leader_retry_period_seconds,
+            )
+
+            async def body(cancel_event: asyncio.Event) -> None:
+                await _run_forwarder(settings, shutdown_event, cancel_event)
+
+            # Race leader-election against the shutdown signal so SIGTERM
+            # exits promptly even when this replica is a follower.
+            election_task = asyncio.create_task(election.run(body))
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            done, pending = await asyncio.wait(
+                {election_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if election_task in done:
+                election_task.result()  # re-raise on error
+        else:
+            await _run_forwarder(settings, shutdown_event)
     finally:
-        logger.info("Shutting down producers")
-        await producer.close()
-        await redis.close()
         logger.info("Event Forwarder stopped")
 
 

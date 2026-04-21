@@ -7,9 +7,16 @@ metadata:
   labels:
     app: event-forwarder
 spec:
-  replicas: 1
+  # Two replicas for HA. A Lease (coordination.k8s.io) gates emission so
+  # only one replica at a time produces StatusEvents; the follower stays
+  # warm and can take over within `lease_duration_seconds` if the leader
+  # dies or is evicted.
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
       app: event-forwarder
@@ -38,3 +45,13 @@ spec:
               value: "8"
             - name: EMIT_INITIAL_STATE
               value: "true"
+            - name: K8S_LEADER_NAMESPACE
+              value: chris-streaming
+            # Downward API: expose the Pod name so the Lease
+            # ``holderIdentity`` is human-readable.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_LEADER_IDENTITY
+              value: "$(POD_NAME)"

@@ -53,6 +53,7 @@ class StreamDispatcher:
         workflow_base: str,
         block_ms: int = 500,
         count: int = 200,
+        subscriber_queue_maxsize: int = 1000,
     ) -> None:
         self._redis = redis
         self._num_shards = num_shards
@@ -63,6 +64,12 @@ class StreamDispatcher:
         }
         self._block_ms = block_ms
         self._count = count
+        # Per-subscriber queue cap: a slow SSE client can lag indefinitely
+        # behind a chatty job (log-heavy plugin). An unbounded queue turns
+        # that backpressure into a memory leak for the SSE process. When
+        # the queue is full we drop the oldest event and enqueue the new
+        # one — log clients tolerate occasional gaps better than an OOM.
+        self._subscriber_queue_maxsize = subscriber_queue_maxsize
         self._subs: dict[str, list[_Subscriber]] = {}
         self._tasks: list[asyncio.Task] = []
         self._running = False
@@ -109,7 +116,7 @@ class StreamDispatcher:
         sub = _Subscriber(
             job_id=job_id,
             event_types=frozenset(event_types),
-            queue=asyncio.Queue(),
+            queue=asyncio.Queue(maxsize=self._subscriber_queue_maxsize),
         )
         self._subs.setdefault(job_id, []).append(sub)
         try:
@@ -125,9 +132,18 @@ class StreamDispatcher:
     async def _reader_loop(self, event_type: str, base: str) -> None:
         """XREAD across every shard of ``base`` and dispatch by job_id."""
         # Keyed by stream name; advance each shard's last-id independently.
-        streams: dict[str, bytes] = {
+        streams: dict[bytes, bytes] = {
             f"{base}:{i}".encode(): b"$" for i in range(self._num_shards)
         }
+        # Resolve every shard's `$` to its concrete current last-id ONCE.
+        # The naive approach of leaving `$` in the dict causes event loss:
+        # XREAD returns as soon as ANY shard has entries, so shards without
+        # new entries keep `$`, which Redis re-resolves to "last-id NOW"
+        # on the next call — silently skipping anything XADDed between
+        # calls. Pinning each shard to a concrete id means the next XREAD
+        # picks up every entry past that id, even on the sparsely-written
+        # shards.
+        await self._resolve_start_ids(streams)
         try:
             while self._running:
                 try:
@@ -171,6 +187,42 @@ class StreamDispatcher:
         except asyncio.CancelledError:
             logger.debug("Dispatcher reader %s cancelled", event_type)
 
+    async def _resolve_start_ids(self, streams: dict[bytes, bytes]) -> None:
+        """Replace ``$`` entries with the concrete last-generated-id per shard.
+
+        XINFO STREAM returns a mapping whose ``last-generated-id`` field
+        holds the highest id currently in the stream. Using it means any
+        later XADD produces an id strictly greater, so subsequent
+        ``XREAD streams=... id=<last-generated-id>`` picks every new
+        entry up — no re-resolution, no gaps between calls.
+
+        If the stream does not exist yet we leave the pointer at ``0-0``
+        so the first XREAD blocks until the first entry is written.
+        """
+        for name in list(streams.keys()):
+            if streams[name] != b"$":
+                continue
+            try:
+                info = await self._redis.xinfo_stream(name)
+            except Exception as e:
+                msg = str(e).lower()
+                if "no such key" in msg or "nokey" in msg:
+                    streams[name] = b"0-0"
+                else:
+                    logger.warning(
+                        "XINFO STREAM %s failed: %s (falling back to 0-0)",
+                        name, e,
+                    )
+                    streams[name] = b"0-0"
+                continue
+            last_id = info.get(b"last-generated-id") or info.get("last-generated-id")
+            if last_id is None:
+                streams[name] = b"0-0"
+            elif isinstance(last_id, bytes):
+                streams[name] = last_id
+            else:
+                streams[name] = str(last_id).encode()
+
     def _decode(self, event_type: str, raw) -> dict:
         decoder = self._DECODERS[event_type]
         if isinstance(raw, str):
@@ -184,5 +236,19 @@ class StreamDispatcher:
             return
         payload = {**event_dict, "_event_type": event_type}
         for sub in self._subs.get(job_id, ()):
-            if event_type in sub.event_types:
+            if event_type not in sub.event_types:
+                continue
+            try:
                 sub.queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Drop the oldest event to make room, then retry. A slow
+                # SSE client will miss events but survive; the alternative
+                # is an unbounded queue and an OOM in the SSE process.
+                try:
+                    sub.queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    sub.queue.put_nowait(payload)
+                except asyncio.QueueFull:
+                    pass

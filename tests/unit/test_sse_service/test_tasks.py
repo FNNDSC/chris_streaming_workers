@@ -24,6 +24,11 @@ def _make_event_data(**overrides):
 def _mock_db(mock_db_ctx):
     mock_conn = MagicMock()
     mock_cur = MagicMock()
+    # MagicMock under Python 3.12+ no longer coerces arithmetic comparisons
+    # to a truthy MagicMock, so an unset rowcount would blow up on
+    # ``rowcount > 0``. Set a concrete default (1 = inserted/updated) so
+    # the typical "happy path" test body runs without extra setup.
+    mock_cur.rowcount = 1
     mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cur)
     mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
     mock_db_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
@@ -537,3 +542,151 @@ class TestStartWorkflowSkipLogic:
         params = json.loads(insert_args[2])
         assert params["requires_copy_job"] is True
         assert params["requires_upload_job"] is True
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_duplicate_start_does_not_reset_running_workflow(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        """A second start_workflow for the same job_id must be a no-op.
+
+        The old implementation used ``ON CONFLICT DO UPDATE SET
+        current_step = EXCLUDED.current_step`` which reset an already-
+        advanced workflow back to its initial step. The fix switches to
+        ``ON CONFLICT DO NOTHING`` + an inspection of ``cur.rowcount``.
+        """
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = _mock_db(mock_db_ctx)
+        # Simulate ON CONFLICT DO NOTHING: no row inserted.
+        mock_cur.rowcount = 0
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.return_value = {
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }
+
+        result = start_workflow("job-x", {"image": "img:1"})
+
+        assert result == {"job_id": "job-x", "status": "already_started"}
+        # No pfcon schedule call when the workflow already exists.
+        mock_execute.assert_not_called()
+
+    @patch("chris_streaming.sse_service.tasks._execute_workflow_step")
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_insert_uses_on_conflict_do_nothing(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon, mock_execute,
+    ):
+        from chris_streaming.sse_service.tasks import start_workflow
+
+        _, mock_cur = _mock_db(mock_db_ctx)
+        mock_cur.rowcount = 1
+        mock_execute.return_value = None  # no synchronous continuation
+        mock_get_redis.return_value = MagicMock()
+        mock_pfcon.get_server_info.return_value = {
+            "requires_copy_job": True,
+            "requires_upload_job": True,
+        }
+
+        start_workflow("job-x", {"image": "img:1"})
+
+        insert_sqls = [
+            c[0][0] for c in mock_cur.execute.call_args_list
+            if "INSERT INTO job_workflow " in c[0][0]
+        ]
+        assert insert_sqls, "expected an INSERT into job_workflow"
+        assert "ON CONFLICT (job_id) DO NOTHING" in insert_sqls[0]
+
+
+class TestConfirmedEventDeterministic:
+    """Bug B: confirmed_* event_id must be stable across Celery retries."""
+
+    @patch("chris_streaming.sse_service.tasks._try_advance_workflow")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_confirmed_event_id_stable_across_calls(
+        self, mock_db_ctx, mock_get_redis, mock_advance,
+    ):
+        from chris_streaming.sse_service.tasks import process_job_status
+
+        _mock_db(mock_db_ctx)
+        mock_redis = MagicMock()
+        mock_get_redis.return_value = mock_redis
+
+        event_data = _make_event_data(
+            status="finishedSuccessfully", exit_code=0,
+            timestamp="2026-01-15T12:00:00+00:00",
+        )
+
+        # Two back-to-back invocations simulate a Celery retry: the
+        # confirmed_* XADD must carry the same event_id both times.
+        process_job_status(event_data)
+        process_job_status(event_data)
+
+        first = json.loads(
+            mock_redis.xadd.call_args_list[0][0][1]["data"].decode("utf-8"),
+        )
+        second = json.loads(
+            mock_redis.xadd.call_args_list[1][0][1]["data"].decode("utf-8"),
+        )
+        assert first["event_id"] == second["event_id"]
+        assert first["timestamp"] == "2026-01-15T12:00:00+00:00"
+
+
+class TestAdvanceWorkflowOrdering:
+    """Bug D: pfcon must be called BEFORE committing the current_step UPDATE."""
+
+    @patch("chris_streaming.sse_service.tasks._pfcon")
+    @patch("chris_streaming.sse_service.tasks._get_redis")
+    @patch("chris_streaming.sse_service.tasks._get_db_conn")
+    def test_pfcon_scheduled_before_update_commit(
+        self, mock_db_ctx, mock_get_redis, mock_pfcon,
+    ):
+        """The UPDATE of current_step must run after pfcon returns.
+
+        Regression guard: a worker crash between commit and pfcon would
+        leave the workflow stuck in the new step with no pfcon call ever
+        made. The fix reorders the protocol so pfcon is invoked first.
+        """
+        from chris_streaming.sse_service.tasks import _try_advance_workflow
+
+        mock_conn, mock_cur = _mock_db(mock_db_ctx)
+        mock_get_redis.return_value = MagicMock()
+        # SELECT FOR UPDATE returns: current_step=copy, params={}.
+        mock_cur.fetchone.return_value = (
+            "copy",
+            {"requires_copy_job": True, "requires_upload_job": True,
+             "image": "img:1", "entrypoint": "/run"},
+        )
+        mock_cur.rowcount = 1
+
+        call_log: list[str] = []
+
+        def _record_pfcon_copy(*a, **kw):
+            call_log.append("pfcon.schedule_plugin")
+            return {"compute": {"status": "started"}}
+
+        # copy→plugin on a finishedSuccessfully event.
+        mock_pfcon.schedule_plugin.side_effect = _record_pfcon_copy
+
+        def _record_execute(sql, *a, **kw):
+            s = sql.strip()
+            if s.startswith("UPDATE job_workflow"):
+                call_log.append("UPDATE")
+            return None
+
+        mock_cur.execute.side_effect = _record_execute
+
+        _try_advance_workflow("job-x", "copy", "finishedSuccessfully")
+
+        # Ordering: pfcon must appear in the call log BEFORE the UPDATE
+        # that advances current_step.
+        assert "pfcon.schedule_plugin" in call_log
+        assert "UPDATE" in call_log
+        assert call_log.index("pfcon.schedule_plugin") < call_log.index("UPDATE"), (
+            f"expected pfcon before UPDATE, got: {call_log}"
+        )

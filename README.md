@@ -43,9 +43,9 @@ Streams are **sharded** on a stable `md5(job_id) mod N` hash so all events for a
 
 ### The four core workers
 
-- **Event Forwarder** (`compute-event-forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and `XADD`s structured status events to the sharded `stream:job-status:{shard}` stream. Stateless, idempotent, restart-safe with auto-reconnect.
+- **Event Forwarder** (`compute-event-forwarder`) — Async daemon that watches Docker daemon events (or Kubernetes Job API) for ChRIS job containers, maps native container states to pfcon's `JobStatus` enum (`notStarted`, `started`, `finishedSuccessfully`, `finishedWithError`, `undefined`), and `XADD`s structured status events to the sharded `stream:job-status:{shard}` stream. Stateless, idempotent, restart-safe with auto-reconnect. **Replica count differs by runtime**: the Docker Compose deployment runs a single replica (safe because only one Docker daemon is watched). The Kubernetes deployment runs two replicas for HA — a `coordination.k8s.io/v1` Lease gates emission so only the elected leader processes events at any time; the standby takes over within one lease TTL if the leader fails.
 
-- **Log Forwarder** (`compute-log-forwarder`) — Tails container stdout/stderr directly from the compute runtime (aiodocker for Docker, kubernetes-asyncio for K8s), filters by the same `org.chrisproject.miniChRIS=plugininstance` label selector used everywhere else, and `XADD`s each line to the sharded `stream:job-logs:{shard}` stream. When a container's log stream reaches EOF (container exited + buffers drained), emits a final `LogEvent` with `eos=true` on the same shard — this is the signal the Log Consumer uses to mark the container's logs as durable. Replaces the previous FluentBit-based log pipeline.
+- **Log Forwarder** (`compute-log-forwarder`) — Tails container stdout/stderr directly from the compute runtime (aiodocker for Docker, kubernetes-asyncio for K8s), filters by the same `org.chrisproject.miniChRIS=plugininstance` label selector used everywhere else, and `XADD`s each line to the sharded `stream:job-logs:{shard}` stream. When a container's log stream reaches EOF (container exited + buffers drained), emits a final `LogEvent` with `eos=true` on the same shard — this is the signal the Log Consumer uses to mark the container's logs as durable. Replaces the previous FluentBit-based log pipeline. Like the Event Forwarder, the Docker deployment uses a single replica while the Kubernetes deployment uses two replicas with the same `coordination.k8s.io` Lease-based leader election.
 
 - **Status Consumer** (`compute-status-consumer`) — Reads status events via `XREADGROUP` from the sharded status streams, then schedules Celery tasks for DB persistence, terminal-status confirmation (the Celery worker re-emits `confirmed_*` events via XADD back to the same status stream so SSE clients and CUBE see them), and workflow advancement. `confirmed_*` events that land on the stream are dropped here to avoid a processing loop. Each replica acquires a lease for a subset of shards; a `PendingReclaimer` recovers PEL entries from crashed workers and routes to `stream:job-status-dlq` after the configured retry budget.
 
@@ -434,6 +434,13 @@ Used by: Event Forwarder, Log Forwarder, Status Consumer, Log Consumer, SSE Serv
 | `K8S_LABEL_SELECTOR` | `chrisproject.org/role=plugininstance` | K8s label selector (K8s-idiomatic `domain/key` form; differs from the Docker flat-key label) |
 | `EMIT_INITIAL_STATE` | `true` | Emit current state of all containers on startup |
 | `DOCKER_RECONCILE_SECONDS` | `0.0` | If > 0, periodically inspect tracked containers and re-emit a status if the mapped state disagrees with last-emitted (0 disables) |
+| `K8S_LEADER_NAMESPACE` | _(required in K8s mode)_ | Namespace where the `coordination.k8s.io` Lease object lives (typically the same namespace as the pod) |
+| `K8S_LEADER_IDENTITY` | hostname + random suffix | Identity used in the Lease's `holderIdentity` field. The K8s manifest sets this to the pod name via the Downward API (`fieldRef: metadata.name`) |
+| `K8S_LEADER_LEASE_DURATION_SECONDS` | `15` | How long a lease is valid without renewal |
+| `K8S_LEADER_RENEW_DEADLINE_SECONDS` | `10` | Leader steps down if it cannot renew within this window (must be < `lease_duration_seconds`) |
+| `K8S_LEADER_RETRY_PERIOD_SECONDS` | `2` | How often a follower retries lease acquisition and the leader renews |
+
+> **K8s only**: when `COMPUTE_ENV=kubernetes` the forwarder enters a leader-election loop before starting the watcher. The Docker Compose deployment runs a single replica and skips leader election entirely.
 
 Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in-cluster K8s config (Kubernetes mode).
 
@@ -446,6 +453,13 @@ Requires the Docker socket mounted at `/var/run/docker.sock` (Docker mode) or in
 | `DOCKER_LABEL_VALUE` | `plugininstance` | Expected value for the filter label |
 | `K8S_NAMESPACE` | `default` | Kubernetes namespace (when `COMPUTE_ENV=kubernetes`) |
 | `K8S_LABEL_SELECTOR` | `chrisproject.org/role=plugininstance` | K8s label selector (K8s-idiomatic `domain/key` form; differs from the Docker flat-key label) |
+| `K8S_LEADER_NAMESPACE` | _(required in K8s mode)_ | Namespace for the `coordination.k8s.io` Lease (same role as Event Forwarder; uses a separate lease named `chris-log-forwarder`) |
+| `K8S_LEADER_IDENTITY` | hostname + random suffix | Identity in the Lease's `holderIdentity` field — set to pod name via Downward API in the K8s manifest |
+| `K8S_LEADER_LEASE_DURATION_SECONDS` | `15` | Lease validity window |
+| `K8S_LEADER_RENEW_DEADLINE_SECONDS` | `10` | Step-down deadline (must be < `lease_duration_seconds`) |
+| `K8S_LEADER_RETRY_PERIOD_SECONDS` | `2` | Retry/renew interval |
+
+> **K8s only**: same leader-election pattern as the Event Forwarder. Docker Compose runs a single replica with no election.
 
 Requires the Docker socket (Docker mode) or in-cluster K8s config (Kubernetes mode).
 

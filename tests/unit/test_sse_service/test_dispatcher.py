@@ -30,6 +30,10 @@ class _ProgrammableRedis:
     ``per_base`` maps a base-stream name (``"stream:job-status"``) to a queue of
     xread replies. The reader loop for each base dispatches to its own queue so
     responses never cross-pollinate between the three concurrent reader tasks.
+
+    ``xinfo_stream`` is faked to always report an empty stream
+    (``last-generated-id = 0-0``) so the dispatcher's start-id resolution
+    doesn't need a real Redis instance.
     """
 
     def __init__(self, per_base: dict[str, list]):
@@ -48,6 +52,11 @@ class _ProgrammableRedis:
         # simulate block timeout
         await asyncio.sleep(0.01)
         return None
+
+    async def xinfo_stream(self, name):
+        # Pretend every stream is empty; the dispatcher will pin its
+        # per-shard pointer to ``0-0``.
+        return {b"last-generated-id": b"0-0"}
 
 
 @pytest.mark.asyncio
@@ -192,3 +201,90 @@ async def test_stop_is_idempotent():
     await dispatcher.start()
     await dispatcher.stop()
     await dispatcher.stop()  # should not raise
+
+
+@pytest.mark.asyncio
+async def test_start_ids_resolved_from_xinfo():
+    """Dispatcher pins each shard to the current last-generated-id so
+    entries on idle shards are not dropped by a re-resolution of ``$``."""
+
+    class _RecordingRedis(_ProgrammableRedis):
+        def __init__(self):
+            super().__init__({})
+            self.xinfo_calls: list[bytes] = []
+            self.xread_calls: list[dict] = []
+
+        async def xinfo_stream(self, name):
+            self.xinfo_calls.append(name)
+            # Report a concrete last-generated-id so the dispatcher uses
+            # it instead of `$`.
+            return {b"last-generated-id": b"42-0"}
+
+        async def xread(self, streams, count=None, block=None):
+            self.xread_calls.append(dict(streams))
+            await asyncio.sleep(0.01)
+            return None
+
+    redis = _RecordingRedis()
+    dispatcher = StreamDispatcher(
+        redis,
+        num_shards=2,
+        status_base="stream:job-status",
+        logs_base="stream:job-logs",
+        workflow_base="stream:job-workflow",
+        block_ms=10,
+    )
+    await dispatcher.start()
+    try:
+        # Give reader loops a moment to perform their first XREAD.
+        await asyncio.sleep(0.1)
+    finally:
+        await dispatcher.stop()
+
+    # 3 bases x 2 shards = 6 XINFO STREAM calls at startup.
+    assert len(redis.xinfo_calls) == 6
+    # Every recorded XREAD must carry concrete ids, never `$`.
+    for call in redis.xread_calls:
+        for k, v in call.items():
+            assert v != b"$", f"stream {k} still pinned to $: {call}"
+
+
+@pytest.mark.asyncio
+async def test_queue_drops_oldest_when_full():
+    """A full subscriber queue drops oldest rather than blocking dispatch."""
+    from chris_streaming.common.schemas import JobStatus, JobType, StatusEvent
+
+    entries = [
+        _entry(
+            StatusEvent(
+                job_id="j1", job_type=JobType.plugin,
+                status=JobStatus.started,
+            ).serialize(),
+            entry_id=f"{i}-0".encode(),
+        )
+        for i in range(10)
+    ]
+
+    redis = _ProgrammableRedis({
+        "stream:job-status": [
+            [(b"stream:job-status:0", entries)],
+        ],
+    })
+    dispatcher = StreamDispatcher(
+        redis,
+        num_shards=1,
+        status_base="stream:job-status",
+        logs_base="stream:job-logs",
+        workflow_base="stream:job-workflow",
+        block_ms=10,
+        subscriber_queue_maxsize=3,
+    )
+    await dispatcher.start()
+    try:
+        async with dispatcher.subscribe("j1", {"status"}) as q:
+            # Wait for dispatch to fill the queue.
+            await asyncio.sleep(0.1)
+            # Bounded capacity honoured: we should have exactly 3 items.
+            assert q.qsize() <= 3
+    finally:
+        await dispatcher.stop()

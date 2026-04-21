@@ -293,7 +293,7 @@ The `PendingReclaimer` periodically scans `XPENDING` for entries older than `rec
 | Dedup | Deterministic `event_id` + LRU cache | Deterministic `event_id` per line | PostgreSQL `ON CONFLICT` upsert (via Celery Worker) | Quickwit document indexing |
 | Backpressure | Bounded streams via `MAXLEN ~` | Bounded streams via `MAXLEN ~` | Per-shard batch reads with explicit `XACK` | Batched processing with configurable flush |
 | Dead letters | — | — | `stream:job-status-dlq` after N deliveries | `stream:job-logs-dlq` after N deliveries |
-| Horizontal scale | Single writer (by design; idempotent on restart) | Single forwarder per compute runtime | Add replicas → each acquires a shard lease | Add replicas → each acquires a shard lease |
+| Horizontal scale | Docker: single writer (one replica by design). Kubernetes: 2 replicas with `coordination.k8s.io` Lease — only the leader emits; follower takes over on leader failure. | Docker: single forwarder. Kubernetes: 2 replicas with the same `coordination.k8s.io` Lease — only the leader tails logs and emits EOS markers. | Add replicas → each acquires a shard lease | Add replicas → each acquires a shard lease |
 
 ## Durability and HA
 

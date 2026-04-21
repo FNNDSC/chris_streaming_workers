@@ -18,6 +18,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log"]
     verbs: ["get", "list", "watch"]
+  # Leader election: see event-forwarder-rbac.yaml for why.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -43,9 +47,15 @@ metadata:
   labels:
     app: log-forwarder
 spec:
-  replicas: 1
+  # Two replicas for HA. See event-forwarder.yaml for the leader-election
+  # rationale — a Lease gates log emission so only one replica tails
+  # container logs at a time.
+  replicas: 2
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
       app: log-forwarder
@@ -72,3 +82,11 @@ spec:
               value: stream:job-logs
             - name: STREAM_NUM_SHARDS
               value: "8"
+            - name: K8S_LEADER_NAMESPACE
+              value: chris-streaming
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: K8S_LEADER_IDENTITY
+              value: "$(POD_NAME)"

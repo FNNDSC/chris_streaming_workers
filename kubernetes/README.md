@@ -140,6 +140,21 @@ Shard count, consumer group names, batch sizes, and reclaim/lease TTLs
 are read from env at pod startup — see the main [README.md](../README.md)
 for the full configuration reference.
 
+## Event Forwarder and Log Forwarder: HA replicas (K8s only)
+
+Unlike the Docker Compose deployment (which runs a single replica of each forwarder), the Kubernetes manifests in `40-workers/` run **two replicas** of both the Event Forwarder and the Log Forwarder. Multiple replicas watching the same cluster would emit duplicate events with non-deterministic timestamps, making cross-replica deduplication impossible.
+
+To solve this, each forwarder uses Kubernetes leader election via the `coordination.k8s.io/v1` Lease API:
+
+- On startup, each replica races to acquire (or take over) a named Lease object in the `chris-streaming` namespace (`chris-event-forwarder` and `chris-log-forwarder` respectively).
+- Only the **leader** replica runs the watcher loop and emits events. The follower idles, holding the Kubernetes API connection open so it can react within one lease TTL if the leader is evicted or crashes.
+- On clean shutdown the leader clears `holderIdentity` so the follower can take over immediately rather than waiting for the TTL to expire.
+- Lease identity is the pod name (injected via the Downward API as `POD_NAME`), making the current leader visible in `kubectl describe lease -n chris-streaming`.
+
+The RBAC manifests (`event-forwarder-rbac.yaml`, `log-forwarder.yaml`) grant `get/list/watch/create/update/patch/delete` on `coordination.k8s.io/leases` in the `chris-streaming` namespace.
+
+This HA model does not apply to the Docker Compose deployment because there is no equivalent to the Kubernetes Lease API there; the Docker forwarders always run as a single replica.
+
 ## Resilience notes
 
 - `celery-worker` has an `initContainer` that blocks on TCP readiness of
